@@ -1,0 +1,170 @@
+diff --git a/examples/inference/task_config_ppd.yaml b/examples/inference/task_config_ppd.yaml
+new file mode 100644
+index 0000000..ac8a496
+--- /dev/null
++++ b/examples/inference/task_config_ppd.yaml
+@@ -0,0 +1,22 @@
++- name: swe_bench
++  sandbox:
++    provider: modal
++    runtime_timeout: 3600
++  agent:
++    name: react
++    max_steps: 50
++    tools:
++      - name: str_replace_editor
++      - name: stateful_shell
++        command_timeout: 180
++        env_vars:
++          PIP_PROGRESS_BAR: "off"
++          PAGER: "cat"
++          MANPAGER: "cat"
++          LESS: "-R"
++          TQDM_DISABLE: "1"
++      - name: submit
++    model:
++      temperature: 0.2
++      top_p: 0.95
++      max_total_tokens: 4096
+diff --git a/uni_agent/agents/react/agent.py b/uni_agent/agents/react/agent.py
+index 7ab20cb..394f4ff 100644
+--- a/uni_agent/agents/react/agent.py
++++ b/uni_agent/agents/react/agent.py
+@@ -2,7 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
++import os
++import time
++from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+ from pydantic import Field
+@@ -18,6 +22,9 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++# PPD profiling: where to save per-step timing trace
++_PROFILE_OUTPUT = os.environ.get("PPD_TRACE_OUTPUT", "/root/vllm-ppd/results/agent_trace.json")
++
+ #: Tool names that end the episode when the policy calls them.
+ _FINISH_TOOLS = {"submit", "finish"}
+ 
+@@ -81,6 +88,8 @@ class ReActAgent(Agent):
+             "timeouts": 0,
+             "errors": 0,
+             "total_tokens": 0,
++            "steps_detail": [],  # PPD profiling: per-step LLM/tool timing
++            "episode_start": time.time(),
+         }
+         termination_reason = "unknown"
+         try:
+@@ -106,6 +115,20 @@ class ReActAgent(Agent):
+             f"tool_calls={trajectory_info['num_tool_calls']} timeouts={trajectory_info['timeouts']} "
+             f"errors={trajectory_info['errors']} total_tokens={trajectory_info['total_tokens']}"
+         )
++
++        # PPD profiling: save per-step timing trace
++        trajectory_info["episode_end"] = time.time()
++        trajectory_info["episode_duration_s"] = round(
++            trajectory_info["episode_end"] - trajectory_info["episode_start"], 1
++        )
++        try:
++            trace_path = Path(_PROFILE_OUTPUT)
++            trace_path.parent.mkdir(parents=True, exist_ok=True)
++            trace_path.write_text(json.dumps(trajectory_info, indent=2, ensure_ascii=False))
++            logger.info(f"PPD trace saved to {trace_path}")
++        except Exception:
++            pass
++
+         return AgentResult(transcript=transcript, info=trajectory_info, finished=termination_reason == "finished")
+ 
+     async def step(
+@@ -118,6 +141,8 @@ class ReActAgent(Agent):
+     ) -> str:
+         """Run one turn: query the policy, record its message, run its tool calls."""
+         logger.info(f"{'=' * 25} STEP {info['steps']} {'=' * 25}")
++        # PPD profiling: wall-clock anchor for aligning with proxy timing / node metrics
++        step_start = time.time()
+ 
+         # step 1: query the model
+         max_tokens = cfg.model.max_tokens_per_turn or cfg.model.max_total_tokens
+@@ -131,7 +156,11 @@ class ReActAgent(Agent):
+         sampling_params: dict[str, Any] = cfg.model.sampling_params()
+         if max_tokens is not None:  # both budgets unset -> let the server run to EOS
+             sampling_params["max_tokens"] = max_tokens
++
++        # PPD profiling: time the LLM call
++        t_llm_start = time.time()
+         content, tool_calls, gen_info = await model.query(transcript, sampling_params=sampling_params)
++        t_llm = time.time() - t_llm_start
+         info["total_tokens"] = gen_info["prompt_tokens"] + gen_info["completion_tokens"]
+         finish_reason = gen_info.get("finish_reason")
+         logger.info(
+@@ -154,16 +183,32 @@ class ReActAgent(Agent):
+             return "token_limit"
+ 
+         if not tool_calls:
++            # PPD profiling: record this step before early return
++            info["steps_detail"].append({
++                "step": info["steps"],
++                "step_start": round(step_start, 3),
++                "llm_time_s": round(t_llm, 3),
++                "tools_time_s": 0,
++                "tools": [],
++                "prompt_tokens": gen_info.get("prompt_tokens", 0),
++                "completion_tokens": gen_info.get("completion_tokens", 0),
++                "finish_reason": finish_reason,
++            })
+             logger.info("💬 FINISHED: policy replied with plain text (no tool call).")
+             return "finished"
+ 
+         # step 2: dispatch the tool calls
+         saw_finish = False
++        step_tool_start = time.time()
++        step_tool_times = []
+         for idx, tool_call in enumerate(tool_calls):
+             fn = tool_call.get("function", {})
+             name = fn.get("name", "")
+             logger.info(f"🎬 ACTION ({name}):\n{fn.get('arguments')}")
++            t_tool_start = time.time()
+             tool_result = await toolbox.call(name, fn.get("arguments"), timeout=cfg.action_timeout)
++            t_tool = time.time() - t_tool_start
++            step_tool_times.append({"name": name, "time_s": round(t_tool, 3)})
+             observation = tool_result.to_observation()
+             info["num_tool_calls"] += 1
+             if tool_result.status == "timeout":  # a tool hit its own timeout (e.g. shell command_timeout)
+@@ -200,6 +245,19 @@ class ReActAgent(Agent):
+                 return "timeout_limit"
+             if name in _FINISH_TOOLS and tool_result.status == "ok":
+                 saw_finish = True
++
++        # PPD profiling: record this step's timing
++        info["steps_detail"].append({
++            "step": info["steps"],
++            "step_start": round(step_start, 3),
++            "llm_time_s": round(t_llm, 3),
++            "tools_time_s": round(time.time() - step_tool_start, 3),
++            "tools": step_tool_times,
++            "prompt_tokens": gen_info.get("prompt_tokens", 0),
++            "completion_tokens": gen_info.get("completion_tokens", 0),
++            "finish_reason": finish_reason,
++        })
++
+         if saw_finish:
+             logger.info("💬 FINISHED: policy called a finish tool.")
+         return "finished" if saw_finish else "completed"
+diff --git a/uni_agent/agents/react/model.py b/uni_agent/agents/react/model.py
+index dc21093..925a296 100644
+--- a/uni_agent/agents/react/model.py
++++ b/uni_agent/agents/react/model.py
+@@ -119,6 +119,7 @@ class OpenAICompatibleChatModel:
+         }
+         if self.tools_schemas:
+             body["tools"] = self.tools_schemas
++            body["tool_choice"] = "required"
+ 
+         data = await self._post_chat_completion(body)
+ 

@@ -7,6 +7,8 @@ import os
 import sys
 import time
 import json
+import gzip
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -40,8 +42,8 @@ def download_wildchat():
         print(f"\nWildChat-1M downloaded in {elapsed:.1f}s")
         print(f"  Train split: {len(dataset['train'])} rows")
 
-        # Save full dataset as JSON
-        output_path = DATA_DIR / "WildChat_1M.json"
+        # Convert to list in memory first (so we can free the HF cache)
+        output_path = DATA_DIR / "WildChat_1M.json.gz"
         print(f"\nConverting to JSON format...")
 
         conversations = []
@@ -57,9 +59,18 @@ def download_wildchat():
             if (i + 1) % 100000 == 0:
                 print(f"  Processed {i + 1} conversations...")
 
+        # Free HF cache before writing to save disk space
+        del dataset
+        hf_cache = os.path.expanduser("~/.cache/huggingface/datasets")
+        if os.path.exists(hf_cache):
+            shutil.rmtree(hf_cache)
+            print("  Freed HF dataset cache")
+
+        # Save as gzip-compressed JSON to save ~70% space
         print(f"Saving to {output_path}...")
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(conversations, f, ensure_ascii=False, default=json_serial)
+        json_str = json.dumps(conversations, ensure_ascii=False, default=json_serial)
+        with gzip.open(output_path, 'wt', encoding='utf-8') as f:
+            f.write(json_str)
 
         size_mb = output_path.stat().st_size / (1024 * 1024)
         print(f"  Full dataset saved: {output_path} ({size_mb:.1f} MB)")
