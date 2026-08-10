@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import socket
@@ -30,6 +31,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -40,6 +42,26 @@ from quart import Quart, request, Response
 # Add project root to path for optimizer imports
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_DIR)
+
+
+# ---- PPD profiling: per-request timing trace (JSONL) ----
+# Each request routed by the proxy appends one line with the pipeline split:
+#   proxy overhead (ts_route - ts_enter), P prefill (ts_prefill_done - ts_route),
+#   decode/stream window (ts_exit - ts_prefill_done), and streamed TTFT.
+_TIMING_LOCK = threading.Lock()
+_TIMING_OUTPUT = os.environ.get(
+    "PPD_PROXY_TIMING_OUTPUT",
+    str(Path(PROJECT_DIR) / "logs" / "proxy_timing.jsonl"),
+)
+
+
+def _write_timing(record: Dict[str, Any]) -> None:
+    try:
+        with _TIMING_LOCK:
+            with open(_TIMING_OUTPUT, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[PROXY] timing write error: {e}")
 
 
 # Global state - instances by type
@@ -118,6 +140,7 @@ DECODE_PORTS_BY_CONFIG = {
     "2R_1P_1pD": {"D": [], "pD": [8200]},
 
     # Mixed D/pD configurations
+    "1P_1pD": {"D": [], "pD": [8200]},
     "1P_2D_1pD": {"D": [8200, 8201], "pD": [8202]},
     "1P_1D_2pD": {"D": [8200], "pD": [8201, 8202]},
     "2P_1D_1pD": {"D": [8200], "pD": [8201]},
@@ -576,6 +599,31 @@ async def forward_request(url: str, data: dict, request_id: str):
 @app.route("/v1/chat/completions", methods=["POST"])
 async def handle_request():
     """Handle inference requests with automatic routing."""
+    t_enter = time.time()
+    t_prefill_done = None
+
+    def _timing_record(t_first: Optional[float]) -> Dict[str, Any]:
+        return {
+            "ts_enter": round(t_enter, 4),
+            "ts_route": round(t_route, 4),
+            "ts_prefill_done": round(t_prefill_done, 4) if t_prefill_done else None,
+            "ts_first_chunk": round(t_first, 4) if t_first else None,
+            "ts_exit": round(time.time(), 4),
+            "route": routing_mode,
+            "turn": turn_number,
+            "conv": conv_hash[:8],
+            "request_id": request_id,
+            "in_tokens": input_tokens,
+            "out_tokens": output_tokens,
+            "ctx_tokens": context_tokens,
+            "prefill_addr": prefill_addr,
+            "decode_addr": decode_addr,
+            "t_route_s": round(t_route - t_enter, 4),
+            "t_prefill_s": round(t_prefill_done - t_route, 4) if t_prefill_done else None,
+            "ttft_s": round(t_first - t_enter, 4) if t_first else None,
+            "t_total_s": round(time.time() - t_enter, 4),
+        }
+
     try:
         data = await request.get_json()
         conv_hash = get_conversation_hash(data)
@@ -606,6 +654,7 @@ async def handle_request():
         prefill_addr, decode_addr, replica_addr, routing_mode = select_servers(
             conv_hash, current_turn + 1, assigned, use_ppd_dynamic=use_ppd_dynamic
         )
+        t_route = time.time()
 
         # Update conversation state
         new_assigned = {}
@@ -712,13 +761,23 @@ async def handle_request():
                 request_id
             ):
                 continue
+            t_prefill_done = time.time()  # P-node prefill complete (KV transfer async)
 
             target_url = f"http://{decode_addr}{request.path}"
 
         # Execute decode/generation
         if is_streaming:
+            async def _timed_stream():
+                # PPD profiling: record first-chunk latency (TTFT) and total
+                t_first = None
+                async for chunk in forward_request(target_url, data, request_id):
+                    if t_first is None:
+                        t_first = time.time()
+                    yield chunk
+                _write_timing(_timing_record(t_first))
+
             return Response(
-                forward_request(target_url, data, request_id),
+                _timed_stream(),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -731,12 +790,19 @@ async def handle_request():
             response_bytes = b""
             async for chunk in forward_request(target_url, data, request_id):
                 response_bytes += chunk
+            _write_timing(_timing_record(None))
             return response_bytes, 200, {"Content-Type": "application/json"}
 
     except Exception as e:
         import traceback
         print(f"[PROXY] Error: {e}")
         traceback.print_exc()
+        _write_timing({
+            "ts_enter": round(t_enter, 4),
+            "ts_exit": round(time.time(), 4),
+            "route": None,
+            "error": f"{type(e).__name__}: {e}",
+        })
         return {"error": str(e)}, 500
 
 
