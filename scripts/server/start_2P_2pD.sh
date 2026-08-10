@@ -92,6 +92,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/prefill0.log" 2>&1 &
 
@@ -104,6 +105,7 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/prefill1.log" 2>&1 &
 
@@ -116,6 +118,7 @@ CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/ppd_decode2.log" 2>&1 &
 
@@ -128,6 +131,7 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/ppd_decode3.log" 2>&1 &
 
