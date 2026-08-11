@@ -388,6 +388,11 @@ def get_conversation_hash(data: dict) -> str:
         else:
             history_str = prompt[:200]
 
+    # PPD experiment: salt the hash so back-to-back runs of the same task
+    # instance (identical first user message) don't collide on the in-memory
+    # turn counter / server affinity. Set PPD_PROXY_EPOCH once per stack start.
+    history_str += os.environ.get("PPD_PROXY_EPOCH", "")
+
     return hashlib.md5(history_str.encode()).hexdigest()
 
 

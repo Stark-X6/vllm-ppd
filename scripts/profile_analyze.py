@@ -22,6 +22,7 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import statistics
 import sys
 from collections import defaultdict
@@ -46,6 +47,12 @@ def load_proxy_timing(path):
 
 
 def load_agent_trace(path):
+    import glob
+    # if path is a glob or directory, find the latest trace
+    if not os.path.isfile(path):
+        candidates = sorted(glob.glob(f"{path}*.json") if "*" not in path else glob.glob(path),
+                            key=os.path.getmtime, reverse=True)
+        path = candidates[0] if candidates else path
     with open(path) as f:
         data = json.load(f)
     return data
@@ -57,8 +64,14 @@ def load_metrics(path):
         for row in csv.DictReader(f):
             for key in row:
                 if key not in ("ts", "port") and row[key] not in (None, ""):
-                    row[key] = float(row[key])
-            row["ts"] = float(row["ts"])
+                    try:
+                        row[key] = float(row[key])
+                    except (ValueError, TypeError):
+                        pass
+            try:
+                row["ts"] = float(row["ts"])
+            except (ValueError, TypeError):
+                continue
             rows.append(row)
     return rows
 
@@ -89,6 +102,14 @@ def main() -> None:
     trace = load_agent_trace(args.agent_trace)
     metrics = load_metrics(args.metrics)
     steps = trace.get("steps_detail", [])
+
+    # Keep only rows inside the episode's wall-clock window; the raw files
+    # accumulate across runs, so without this stale requests pollute the split.
+    ep_start = trace.get("episode_start") or (steps[0]["step_start"] - 2 if steps else 0)
+    ep_end = trace.get("episode_end") or (ep_start + trace.get("episode_duration_s", 0))
+    proxy = [r for r in proxy if (r.get("ts_enter") or 0) >= ep_start - 2 and
+             (r.get("ts_enter") or 0) <= ep_end + 5]
+    metrics = [m for m in metrics if m.get("ts", 0) >= ep_start - 2 and m.get("ts", 0) <= ep_end + 5]
 
     print("=" * 78)
     print("PPD agent session analysis")

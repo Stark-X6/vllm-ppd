@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # metric name -> regex group for the value (tolerates optional {label} suffix)
 METRIC_PATTERNS = {
-    "cache_usage_pct": r"vllm:gpu_cache_usage_perc(?:\{[^}]*\})?\s+([0-9.e+-]+)",
+    "cache_usage_pct": r"vllm:kv_cache_usage_perc(?:\{[^}]*\})?\s+([0-9.e+-]+)",
     "requests_running": r"vllm:num_requests_running(?:\{[^}]*\})?\s+([0-9.]+)",
     "requests_waiting": r"vllm:num_requests_waiting(?:\{[^}]*\})?\s+([0-9.]+)",
     "preemptions": r"vllm:num_preemptions_total(?:\{[^}]*\})?\s+([0-9.]+)",
@@ -32,12 +32,12 @@ METRIC_PATTERNS = {
     "tpot_sum": r"vllm:time_per_output_token_seconds_sum(?:\{[^}]*\})?\s+([0-9.e+-]+)",
     "tpot_count": r"vllm:time_per_output_token_seconds_count(?:\{[^}]*\})?\s+([0-9.]+)",
     "prefix_cache_hits": r"vllm:prefix_cache_hits_total(?:\{[^}]*\})?\s+([0-9.]+)",
-    "prefix_cache_misses": r"vllm:prefix_cache_misses_total(?:\{[^}]*\})?\s+([0-9.]+)",
+    "prefix_cache_queries": r"vllm:prefix_cache_queries_total(?:\{[^}]*\})?\s+([0-9.]+)",
 }
 
 CSV_HEADER = [
     "ts", "port", "cache_usage_pct", "running", "waiting",
-    "ttft_ms", "tpot_ms", "prefix_hits", "prefix_misses", "preemptions",
+    "ttft_ms", "tpot_ms", "prefix_hits", "prefix_queries", "preemptions",
 ]
 
 
@@ -65,7 +65,7 @@ def fetch_metrics(port: int, timeout: float = 2.0) -> dict:
     if vals["tpot_count"]:
         out["tpot_ms"] = round(1000 * vals["tpot_sum"] / vals["tpot_count"], 3)
     out["prefix_hits"] = vals["prefix_cache_hits"]
-    out["prefix_misses"] = vals["prefix_cache_misses"]
+    out["prefix_queries"] = vals["prefix_cache_queries"]
     return out
 
 

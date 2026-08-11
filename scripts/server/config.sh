@@ -12,14 +12,18 @@
 # ============================================================================
 
 # Model path - set MODEL_PATH env var before sourcing this file
-export MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-3.1-8B}"
+export MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/Qwen3-32B}"
 
 # Model name for pkill (derived from MODEL_PATH if not set)
 export MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B}"
 
 # Model settings (support environment variable override)
-export MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-24576}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
+
+# Conversation-hash salt: one per stack start, so re-running the same task
+# instance doesn't inherit turn counters / server affinity from a prior run.
+export PPD_PROXY_EPOCH="${PPD_PROXY_EPOCH:-$(date +%s)}"
 
 # Project directory
 export PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

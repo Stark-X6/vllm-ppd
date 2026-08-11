@@ -24,9 +24,11 @@ source "$SCRIPT_DIR/common.sh" 2>/dev/null || true
 check_environment || exit 1
 
 # Check GPU availability (GPUs 0-3)
+# Note: check_gpu_availability returns 2 when GPUs are busy (needs cleanup) --
+# guard the call so its non-zero return doesn't trip `set -e`.
 echo ""
-check_gpu_availability "0,1,2,3"
-gpu_status=$?
+gpu_status=0
+check_gpu_availability "0,1,2,3" || gpu_status=$?
 if [ $gpu_status -eq 1 ]; then
     exit 1
 elif [ $gpu_status -eq 2 ]; then
@@ -92,7 +94,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice --tool-call-parser hermes \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/prefill0.log" 2>&1 &
 
@@ -105,7 +107,7 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice --tool-call-parser hermes \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/prefill1.log" 2>&1 &
 
@@ -118,7 +120,7 @@ CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice --tool-call-parser hermes \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/ppd_decode2.log" 2>&1 &
 
@@ -131,7 +133,7 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
     --enable-prefix-caching \
-    --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+    --enable-auto-tool-choice --tool-call-parser hermes \
     --kv-transfer-config "$KV_CONFIG" \
     > "$LOG_DIR/ppd_decode3.log" 2>&1 &
 
