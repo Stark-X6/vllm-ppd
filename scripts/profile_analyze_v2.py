@@ -323,6 +323,55 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
             f"reusable~={int(reusable) if reusable else 'unknown'} next_prompt={next_prompt or 'unknown'} "
             f"retention={f'{retention:.1%}' if retention is not None else 'unknown'}"
         )
+    # Report material loss between consecutive logical requests. The 90%
+    # threshold excludes normal cache-block alignment differences.
+    print("\nCache loss events (retention < 90%):")
+    print(f"  {'steps':>7} {'node':>5} {'reusable':>9} {'cached':>8} {'lost':>8} "
+          f"{'retain':>7} {'other active episodes':>28} {'wait':>5} {'kv_max':>7} {'llm_s':>7}")
+    loss_count = 0
+    ordered_steps = sorted(steps, key=lambda item: int(item.get("step", 0)))
+    for previous_step, next_step in zip(ordered_steps, ordered_steps[1:]):
+        requests = step_requests.get(next_step.get("step"), [])
+        final = requests[-1] if requests else {}
+        cached = next_step.get("cached_tokens")
+        if cached is None:
+            cached = final.get("cached_tokens")
+        reusable = float(previous_step.get("prompt_tokens") or 0) + float(previous_step.get("completion_tokens") or 0)
+        if not reusable or not isinstance(cached, (int, float)):
+            continue
+        retention = float(cached) / reusable
+        if retention >= 0.90:
+            continue
+        node_addr = str(final.get("decode_addr") or "")
+        port = node_addr.rsplit(":", 1)[-1] if node_addr else "-"
+        request_start = float(final.get("ts_enter") or next_step.get("llm_start_ts") or 0)
+        request_end = float(final.get("ts_exit") or next_step.get("llm_end_ts") or request_start)
+        pause_start = float(previous_step.get("llm_end_ts") or previous_step.get("step_end") or request_start)
+        current_episode = trace.get("episode_id")
+        other_active = sorted({
+            str(row.get("episode_id")) for row in proxy_overlaps(all_proxy, min(pause_start, request_start), request_end)
+            if row.get("episode_id") and row.get("episode_id") != current_episode
+            and str(row.get("decode_addr") or "") == node_addr
+            and (not run_id or not row.get("run_id") or row.get("run_id") == run_id)
+        })
+        node_metrics = [
+            row for row in window_rows(all_metrics, request_start, request_end)
+            if str(int(float(row.get("port")))) == port and row.get("status") != "error"
+            and (not run_id or not row.get("run_id") or row.get("run_id") == run_id)
+        ]
+        waiting = metric_values(node_metrics, "waiting")
+        cache = metric_values(node_metrics, "cache_usage_pct")
+        active_text = ",".join(episode[:12] for episode in other_active) or "none"
+        lost = max(0, round(reusable - float(cached)))
+        wait_text = f"{max(waiting):.0f}" if waiting else "?"
+        kv_text = f"{max(cache):.1%}" if cache else "?"
+        print(f"  {int(previous_step.get('step', 0)):>3}->{int(next_step.get('step', 0)):<3} {port:>5} "
+              f"{int(reusable):>9} {int(cached):>8} {lost:>8} {retention:>7.1%} "
+              f"{active_text:>28} {wait_text:>5} {kv_text:>7} "
+              f"{float(next_step.get('llm_time_s') or 0):>7.2f}")
+        loss_count += 1
+    if not loss_count:
+        print("  (none)")
 
     llm = sum(float(step.get("llm_time_s") or 0) for step in steps)
     tools = sum(float(event.get("time_s") or 0) for event in tool_events(trace))
