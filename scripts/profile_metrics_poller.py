@@ -63,7 +63,10 @@ def fetch_metrics(port: int, run_id: str, timeout: float = 2.0) -> dict:
         "status": "error",
     })
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=timeout) as resp:
+        # Cloud environments commonly inject HTTP_PROXY. Local vLLM metrics
+        # must never leave the host or depend on NO_PROXY spelling.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/metrics", timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace")
     except Exception:
         out["ts"] = round(time.time(), 3)
