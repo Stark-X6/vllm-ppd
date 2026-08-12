@@ -28,8 +28,8 @@ export TOOL_CALL_PARSER
 export MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B}"
 
 # Model settings (support environment variable override)
-export MAX_MODEL_LEN="${MAX_MODEL_LEN:-24576}"
-export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
 
 # Conversation-hash salt: one per stack start, so re-running the same task
 # instance doesn't inherit turn counters / server affinity from a prior run.
