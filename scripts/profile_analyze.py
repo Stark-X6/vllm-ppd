@@ -234,4 +234,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from profile_analyze_v2 import main as main_v2
+    sys.exit(main_v2())

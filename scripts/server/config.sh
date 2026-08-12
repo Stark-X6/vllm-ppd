@@ -14,6 +14,16 @@
 # Model path - set MODEL_PATH env var before sourcing this file
 export MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/Qwen3-32B}"
 
+# Qwen3-Coder uses its dedicated structured tool parser; dense Qwen3 uses Hermes.
+# TOOL_CALL_PARSER can still be overridden explicitly for another model.
+if [ -z "${TOOL_CALL_PARSER:-}" ]; then
+    case "$MODEL_PATH" in
+        *Qwen3-Coder*) TOOL_CALL_PARSER="qwen3_coder" ;;
+        *) TOOL_CALL_PARSER="hermes" ;;
+    esac
+fi
+export TOOL_CALL_PARSER
+
 # Model name for pkill (derived from MODEL_PATH if not set)
 export MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B}"
 

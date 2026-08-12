@@ -53,12 +53,22 @@ _TIMING_OUTPUT = os.environ.get(
     "PPD_PROXY_TIMING_OUTPUT",
     str(Path(PROJECT_DIR) / "logs" / "proxy_timing.jsonl"),
 )
+_RUN_OUTPUT_ROOT = Path(os.environ.get(
+    "PPD_RUN_OUTPUT_ROOT",
+    str(Path(PROJECT_DIR) / "logs" / "runs"),
+))
 
 
 def _write_timing(record: Dict[str, Any]) -> None:
     try:
+        output_path = Path(_TIMING_OUTPUT)
+        run_id = str(record.get("run_id") or "unscoped")
+        if run_id != "unscoped":
+            safe_run_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_id)
+            output_path = _RUN_OUTPUT_ROOT / safe_run_id / "proxy_timing.jsonl"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with _TIMING_LOCK:
-            with open(_TIMING_OUTPUT, "a", encoding="utf-8") as f:
+            with open(output_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[PROXY] timing write error: {e}")
@@ -364,9 +374,13 @@ def log_ppd_decision(
             PPD_DECISION_LOG = PPD_DECISION_LOG[-10000:]
 
 
-def get_conversation_hash(data: dict) -> str:
+def get_conversation_hash(
+    data: dict, *, conversation_id: Optional[str] = None, run_id: Optional[str] = None
+) -> str:
     """Generate a hash to identify a conversation."""
-    if "messages" in data:
+    if conversation_id:
+        history_str = f"{run_id or 'unscoped'}|{conversation_id}"
+    elif "messages" in data:
         messages = data.get("messages", [])
         first_user = next((m for m in messages if m.get("role") == "user"), None)
         if first_user:
@@ -586,7 +600,9 @@ def select_servers(
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
-async def forward_request(url: str, data: dict, request_id: str):
+async def forward_request(
+    url: str, data: dict, request_id: str, response_meta: Optional[Dict[str, Any]] = None
+):
     """Forward request to vLLM with streaming support."""
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         headers = {
@@ -594,6 +610,8 @@ async def forward_request(url: str, data: dict, request_id: str):
             "X-Request-Id": request_id,
         }
         async with session.post(url=url, json=data, headers=headers) as response:
+            if response_meta is not None:
+                response_meta["status"] = response.status
             # Always yield the response content, even for error status
             async for chunk_bytes in response.content.iter_any():
                 if chunk_bytes:
@@ -606,9 +624,23 @@ async def handle_request():
     """Handle inference requests with automatic routing."""
     t_enter = time.time()
     t_prefill_done = None
+    response_usage: Dict[str, Any] = {}
+    prefill_response_meta: Dict[str, Any] = {}
+    decode_response_meta: Dict[str, Any] = {}
+    profile_context = {
+        "schema_version": 2,
+        "run_id": request.headers.get("X-PPD-Run-ID", "unscoped"),
+        "episode_id": request.headers.get("X-PPD-Episode-ID"),
+        "conversation_id": request.headers.get("X-PPD-Conversation-ID"),
+        "step_id": request.headers.get("X-PPD-Step-ID"),
+        "client_request_id": request.headers.get("X-PPD-Client-Request-ID"),
+        "request_phase": request.headers.get("X-PPD-Request-Phase", "default"),
+        "request_attempt": request.headers.get("X-PPD-Request-Attempt", "1"),
+    }
 
     def _timing_record(t_first: Optional[float]) -> Dict[str, Any]:
-        return {
+        record = {
+            **profile_context,
             "ts_enter": round(t_enter, 4),
             "ts_route": round(t_route, 4),
             "ts_prefill_done": round(t_prefill_done, 4) if t_prefill_done else None,
@@ -625,13 +657,22 @@ async def handle_request():
             "decode_addr": decode_addr,
             "t_route_s": round(t_route - t_enter, 4),
             "t_prefill_s": round(t_prefill_done - t_route, 4) if t_prefill_done else None,
-            "ttft_s": round(t_first - t_enter, 4) if t_first else None,
+            # First transport chunk is not necessarily the first generated token.
+            "ttfc_s": round(t_first - t_enter, 4) if t_first else None,
+            "prefill_status": prefill_response_meta.get("status"),
+            "decode_status": decode_response_meta.get("status"),
             "t_total_s": round(time.time() - t_enter, 4),
         }
+        record.update(response_usage)
+        return record
 
     try:
         data = await request.get_json()
-        conv_hash = get_conversation_hash(data)
+        conv_hash = get_conversation_hash(
+            data,
+            conversation_id=profile_context["conversation_id"],
+            run_id=profile_context["run_id"],
+        )
 
         # Get conversation state
         current_turn, assigned = get_conversation_info(conv_hash)
@@ -639,12 +680,9 @@ async def handle_request():
         # Dynamic PPD decision
         use_ppd_dynamic = False
         ppd_decision = None
-        input_tokens, output_tokens, context_tokens = 0, 0, 0
+        input_tokens, output_tokens, context_tokens = extract_request_features(data)
 
         if ENABLE_PPD_MODE and PPD_DECISION_ENGINE is not None:
-            # Extract request features for PPD decision
-            input_tokens, output_tokens, context_tokens = extract_request_features(data)
-
             # Call decision engine (returns False for Turn 1)
             ppd_decision = PPD_DECISION_ENGINE.should_use_ppd(
                 turn=current_turn + 1,
@@ -763,7 +801,8 @@ async def handle_request():
             async for _ in forward_request(
                 f"http://{prefill_addr}{request.path}",
                 prefill_request,
-                request_id
+                request_id,
+                prefill_response_meta,
             ):
                 continue
             t_prefill_done = time.time()  # P-node prefill complete (KV transfer async)
@@ -773,9 +812,11 @@ async def handle_request():
         # Execute decode/generation
         if is_streaming:
             async def _timed_stream():
-                # PPD profiling: record first-chunk latency (TTFT) and total
+                # PPD profiling: record first transport chunk (TTFC) and total.
                 t_first = None
-                async for chunk in forward_request(target_url, data, request_id):
+                async for chunk in forward_request(
+                    target_url, data, request_id, decode_response_meta
+                ):
                     if t_first is None:
                         t_first = time.time()
                     yield chunk
@@ -793,16 +834,35 @@ async def handle_request():
             )
         else:
             response_bytes = b""
-            async for chunk in forward_request(target_url, data, request_id):
+            async for chunk in forward_request(
+                target_url, data, request_id, decode_response_meta
+            ):
                 response_bytes += chunk
+            try:
+                response_json = json.loads(response_bytes)
+                usage = response_json.get("usage") or {}
+                details = usage.get("prompt_tokens_details") or {}
+                response_usage.update({
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                    "cached_tokens": details.get("cached_tokens"),
+                })
+                if response_json.get("error"):
+                    response_usage["upstream_error"] = str(response_json["error"])[:1000]
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
             _write_timing(_timing_record(None))
-            return response_bytes, 200, {"Content-Type": "application/json"}
+            return response_bytes, decode_response_meta.get("status", 502), {
+                "Content-Type": "application/json"
+            }
 
     except Exception as e:
         import traceback
         print(f"[PROXY] Error: {e}")
         traceback.print_exc()
         _write_timing({
+            **profile_context,
             "ts_enter": round(t_enter, 4),
             "ts_exit": round(time.time(), 4),
             "route": None,
