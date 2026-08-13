@@ -11,6 +11,7 @@ import csv
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -136,9 +137,60 @@ def requests_for_step(
     return [nearest] if abs(float(nearest["ts_enter"]) - start) <= 1.0 else []
 
 
+def parse_tool_arguments(tool_call: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    raw = str((tool_call.get("function") or {}).get("arguments") or "")
+    try:
+        value = json.loads(raw)
+        return (value if isinstance(value, dict) else {}), raw
+    except (TypeError, json.JSONDecodeError):
+        return {}, raw
+
+
+def classify_tool_operation(name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    """Return a stable operation label and a short human-readable detail."""
+    if name == "shell":
+        command = str(arguments.get("command") or "")
+        flat = " ".join(command.split())
+        # Put test runners before generic python so `python -m pytest` remains
+        # comparable with a direct `pytest` invocation.
+        patterns = (
+            ("pytest", r"(^|\W)pytest(\W|$)"),
+            ("unittest", r"(^|\W)unittest(\W|$)"),
+            ("tox", r"(^|\W)tox(\W|$)"),
+            ("grep", r"(^|\W)(?:rg|grep)(\W|$)"),
+            ("find", r"(^|\W)find(\W|$)"),
+            ("git", r"(^|\W)git(\W|$)"),
+            ("pip", r"(^|\W)(?:pip|pip3)(\W|$)"),
+            ("python", r"(^|\W)python(?:3(?:\.\d+)?)?(\W|$)"),
+            ("make", r"(^|\W)make(\W|$)"),
+        )
+        labels = [label for label, pattern in patterns if re.search(pattern, command)]
+        if "pytest" in labels:
+            family = "pytest"
+        elif "unittest" in labels:
+            family = "unittest"
+        elif "tox" in labels:
+            family = "tox"
+        else:
+            family = "+".join(labels) or "other"
+        return f"shell:{family}", flat[:120] or "(empty command)"
+
+    if name == "str_replace_editor":
+        operation = str(arguments.get("command") or "unknown")
+        path = str(arguments.get("path") or "")
+        return f"editor:{operation}", path[:120]
+
+    return name or "unknown", ""
+
+
 def tool_events(trace: dict[str, Any]) -> list[dict[str, Any]]:
     events = []
     for step in trace.get("steps_detail", []):
+        assistant = step.get("assistant_message") or step.get("response") or {}
+        tool_calls = {
+            call.get("id"): call for call in (assistant.get("tool_calls") or [])
+            if isinstance(call, dict) and call.get("id")
+        }
         cursor = float(
             step.get("tools_start_ts")
             or (float(step.get("step_start") or 0) + float(step.get("llm_time_s") or 0))
@@ -147,6 +199,9 @@ def tool_events(trace: dict[str, Any]) -> list[dict[str, Any]]:
             start = float(tool.get("start_ts") or cursor)
             duration = float(tool.get("time_s") or 0)
             end = float(tool.get("end_ts") or start + duration)
+            tool_call = tool_calls.get(tool.get("tool_call_id"), {})
+            arguments, raw_arguments = parse_tool_arguments(tool_call)
+            operation, detail = classify_tool_operation(str(tool.get("name") or ""), arguments)
             events.append({
                 **tool,
                 "step": step.get("step"),
@@ -154,9 +209,85 @@ def tool_events(trace: dict[str, Any]) -> list[dict[str, Any]]:
                 "start_ts": start,
                 "end_ts": end,
                 "time_s": duration,
+                "arguments": arguments,
+                "raw_arguments": raw_arguments,
+                "operation": operation,
+                "detail": detail,
             })
             cursor = end
     return events
+
+
+def print_tool_operation_summary(events: list[dict[str, Any]], title: str) -> None:
+    print(f"\n{title}:")
+    if not events:
+        print("  no tool calls")
+        return
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        grouped[str(event.get("operation") or event.get("name") or "unknown")].append(event)
+    print(f"  {'operation':<24} {'count':>5} {'total_s':>9} {'mean_s':>8} "
+          f"{'p50_s':>8} {'p90_s':>8} {'max_s':>8} {'errors':>6}")
+    for operation, rows in sorted(grouped.items(), key=lambda item: -sum(row["time_s"] for row in item[1])):
+        durations = [float(row.get("time_s") or 0) for row in rows]
+        errors = sum(row.get("status") not in (None, "ok", "legacy") for row in rows)
+        print(
+            f"  {operation:<24.24} {len(rows):>5} {sum(durations):>9.2f} "
+            f"{statistics.mean(durations):>8.2f} {percentile(durations, .5):>8.2f} "
+            f"{percentile(durations, .9):>8.2f} {max(durations):>8.2f} {errors:>6}"
+        )
+
+
+def cache_source(route: str) -> str:
+    if route in ("ppd", "pd"):
+        return "xfer"
+    if route in ("ppd_direct", "ppd_dynamic"):
+        return "local"
+    return "unknown"
+
+
+def response_kind(step: dict[str, Any]) -> str:
+    raw_response = step.get("response") or {}
+    choices = raw_response.get("choices") or []
+    message = (choices[0].get("message") or {}) if choices else {}
+    if not message:
+        message = step.get("assistant_message") or {}
+    content = str(message.get("content") or "")
+    has_reasoning = bool(
+        message.get("reasoning")
+        or message.get("reasoning_content")
+        or "<think>" in content
+    )
+    has_tools = bool(message.get("tool_calls"))
+    if has_reasoning:
+        return "think+tool" if has_tools else "think"
+    if has_tools:
+        return "tool"
+    return "text" if content else "empty"
+
+
+def cache_observation(
+    step: dict[str, Any], requests: list[dict[str, Any]]
+) -> tuple[int | float, int | float | None, dict[str, Any], bool]:
+    """Return the pre-generation cache state for one logical agent step.
+
+    A tool-choice retry reuses the exact prompt just processed by its failed
+    first HTTP request. Its final response therefore reports an artificially
+    warm cache. Use the first physical request when it has usage data;
+    otherwise mark cache state unknown rather than treating the retry as TTL
+    retention evidence.
+    """
+    initial = requests[0] if requests else {}
+    final = requests[-1] if requests else {}
+    retry = bool(step.get("tool_choice_retry")) or len(requests) > 1
+    prompt = step.get("prompt_tokens") or initial.get("prompt_tokens") or final.get("prompt_tokens") or 0
+    if retry:
+        cached = initial.get("cached_tokens")
+    else:
+        cached = step.get("cached_tokens")
+        if cached is None:
+            cached = final.get("cached_tokens")
+    return prompt, cached, initial or final, retry
 
 
 def summarize_load(
@@ -260,28 +391,41 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
             print(f"  WARNING: {warning}")
 
     print("\nPer-step LLM requests:")
+    print("  cache%=cached/prompt; retain%=cached/(previous prompt+response); "
+          "src xfer=P-to-pD KV transfer, local=pD prefix cache")
+    print("  resp_tok=server usage.completion_tokens; includes text/reasoning/tool-call serialization")
     print(f"{'step':>4} {'route':>11} {'turn':>4} {'node':>5} {'phys':>4} {'llm_s':>7} "
-          f"{'prompt':>7} {'cached':>7} {'hit%':>6} {'output':>6} {'retry':>5}")
+          f"{'prompt':>7} {'cached':>7} {'cache%':>7} {'retain%':>7} {'src':>7} "
+          f"{'resp_tok':>8} {'kind':>10} {'retry':>5}")
     step_requests = {}
-    for step in steps:
+    ordered_steps = sorted(steps, key=lambda item: int(item.get("step", 0)))
+    previous_step = None
+    for step in ordered_steps:
         requests = requests_for_step(trace, step, proxy)
         step_requests[step.get("step")] = requests
-        final = requests[-1] if requests else {}
-        prompt = step.get("prompt_tokens") or final.get("prompt_tokens") or 0
-        cached = step.get("cached_tokens")
-        if cached is None:
-            cached = final.get("cached_tokens")
+        prompt, cached, initial, retry = cache_observation(step, requests)
         hit = (100 * cached / prompt) if isinstance(cached, (int, float)) and prompt else None
-        node = str(final.get("decode_addr") or "-").rsplit(":", 1)[-1]
-        retry = bool(step.get("tool_choice_retry")) or len(requests) > 1
+        reusable = 0
+        if previous_step:
+            reusable = (
+                float(previous_step.get("prompt_tokens") or 0)
+                + float(previous_step.get("completion_tokens") or 0)
+            )
+        retention = (100 * cached / reusable) if isinstance(cached, (int, float)) and reusable else None
+        node = str(initial.get("decode_addr") or "-").rsplit(":", 1)[-1]
+        route = str(initial.get("route", "-"))
         print(
-            f"{int(step.get('step', 0)):>4} {str(final.get('route', '-')):>11} "
-            f"{str(final.get('turn', '-')):>4} {node:>5} {len(requests):>4} "
+            f"{int(step.get('step', 0)):>4} {route:>11} "
+            f"{str(initial.get('turn', '-')):>4} {node:>5} {len(requests):>4} "
             f"{float(step.get('llm_time_s') or 0):>7.2f} {int(prompt):>7} "
             f"{str(int(cached)) if isinstance(cached, (int, float)) else '-':>7} "
-            f"{f'{hit:.1f}' if hit is not None else '-':>6} "
-            f"{int(step.get('completion_tokens') or 0):>6} {str(retry):>5}"
+            f"{f'{hit:.2f}' if hit is not None else '-':>7} "
+            f"{f'{retention:.2f}' if retention is not None else '-':>7} "
+            f"{cache_source(route):>7} "
+            f"{int(step.get('completion_tokens') or 0):>8} "
+            f"{response_kind(step):>10} {str(retry):>5}"
         )
+        previous_step = step
 
     events = sorted(tool_events(trace), key=lambda event: event["time_s"], reverse=True)
     print("\nSlowest tool calls and server load during each call:")
@@ -289,9 +433,10 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         load = summarize_load(all_metrics, all_proxy, event["start_ts"], event["end_ts"])
         print(
             f"  step={event['step']:>3} idx={event['tool_index']} "
-            f"{str(event.get('name')):>20} {event['time_s']:>8.3f}s "
-            f"status={event.get('status', 'legacy')} | {load}"
+            f"{str(event.get('operation')):>24} {event['time_s']:>8.3f}s "
+            f"status={event.get('status', 'legacy')} detail={event.get('detail') or '-'} | {load}"
         )
+    print_tool_operation_summary(events, "Tool operation breakdown")
 
     print("\nTTL evidence (long tool pause -> next logical request cache retention):")
     if not events:
@@ -303,11 +448,7 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
             print(f"  step={event['step']} pause={event['time_s']:.3f}s -> no next request")
             continue
         requests = step_requests.get(next_step.get("step"), [])
-        final = requests[-1] if requests else {}
-        cached = next_step.get("cached_tokens")
-        if cached is None:
-            cached = final.get("cached_tokens")
-        next_prompt = next_step.get("prompt_tokens") or final.get("prompt_tokens") or 0
+        next_prompt, cached, _, _ = cache_observation(next_step, requests)
         previous_step = next(
             (step for step in steps if int(step.get("step", 0)) == int(event["step"])),
             {},
@@ -329,23 +470,19 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
     print(f"  {'steps':>7} {'node':>5} {'reusable':>9} {'cached':>8} {'lost':>8} "
           f"{'retain':>7} {'other active episodes':>28} {'wait':>5} {'kv_max':>7} {'llm_s':>7}")
     loss_count = 0
-    ordered_steps = sorted(steps, key=lambda item: int(item.get("step", 0)))
     for previous_step, next_step in zip(ordered_steps, ordered_steps[1:]):
         requests = step_requests.get(next_step.get("step"), [])
-        final = requests[-1] if requests else {}
-        cached = next_step.get("cached_tokens")
-        if cached is None:
-            cached = final.get("cached_tokens")
+        _, cached, initial, _ = cache_observation(next_step, requests)
         reusable = float(previous_step.get("prompt_tokens") or 0) + float(previous_step.get("completion_tokens") or 0)
         if not reusable or not isinstance(cached, (int, float)):
             continue
         retention = float(cached) / reusable
         if retention >= 0.90:
             continue
-        node_addr = str(final.get("decode_addr") or "")
+        node_addr = str(initial.get("decode_addr") or "")
         port = node_addr.rsplit(":", 1)[-1] if node_addr else "-"
-        request_start = float(final.get("ts_enter") or next_step.get("llm_start_ts") or 0)
-        request_end = float(final.get("ts_exit") or next_step.get("llm_end_ts") or request_start)
+        request_start = float(initial.get("ts_enter") or next_step.get("llm_start_ts") or 0)
+        request_end = float(initial.get("ts_exit") or next_step.get("llm_end_ts") or request_start)
         pause_start = float(previous_step.get("llm_end_ts") or previous_step.get("step_end") or request_start)
         current_episode = trace.get("episode_id")
         other_active = sorted({
@@ -426,6 +563,11 @@ def main() -> int:
     metrics = load_metrics(metrics_path)
     for trace in traces:
         analyze_trace(trace, proxy, metrics)
+    print("=" * 100)
+    print_tool_operation_summary(
+        [event for trace in traces for event in tool_events(trace)],
+        "Run-wide tool operation breakdown",
+    )
     return 0
 
 
