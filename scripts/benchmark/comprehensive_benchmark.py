@@ -51,6 +51,7 @@ from pathlib import Path
 # ============================================================================
 
 from ppd.config import MODEL_PATH
+from ppd.optimizer.calibration_contract import calibration_result_filename
 
 PROXY_URL = "http://localhost:10001"
 
@@ -87,7 +88,7 @@ T2_CONFIGS = {
 }
 
 # QPS test points
-QPS_POINTS = [0.5, 1, 2, 4, 6, 8, 10, 12, 16, 20]
+QPS_POINTS = [0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0]
 
 # Benchmark parameters
 DURATION_PER_POINT_SEC = 10
@@ -762,7 +763,7 @@ def save_checkpoint(checkpoint_file: Path, completed: set):
 
 def get_test_point_key(config: str, workload: str, qps: float) -> str:
     """Generate unique key for a test point"""
-    return f"{config}_{workload}_{qps}"
+    return calibration_result_filename(config, workload, qps).removesuffix(".json")
 
 
 # ============================================================================
@@ -772,7 +773,7 @@ def get_test_point_key(config: str, workload: str, qps: float) -> str:
 def save_result(result: BenchmarkResult, output_dir: Path):
     """Save a single benchmark result"""
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{result.config}_{result.workload}_{result.qps}.json"
+    filename = calibration_result_filename(result.config, result.workload, result.qps)
     filepath = output_dir / filename
 
     # Convert to dict

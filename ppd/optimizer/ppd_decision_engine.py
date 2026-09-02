@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
 
+from .calibration_contract import calibration_result_filename_candidates
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,7 +100,7 @@ CONFIG_PAIRS = {
 }
 
 # Available QPS points from benchmark
-QPS_POINTS = [0.5, 1, 2, 4, 6, 8, 10, 12, 16, 20]
+QPS_POINTS = [0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0]
 
 
 def classify_context_length(context_tokens: int) -> str:
@@ -227,19 +229,53 @@ class PPDDecisionEngine:
         logger.info(f"  Lookup table entries: {len(self.lookup_table)}")
 
     def _load_benchmark_result(self, config: str, workload: str, qps: float) -> Optional[dict]:
-        """Load a single benchmark result file."""
-        filename = f"{config}_{workload}_{qps}.json"
-        filepath = self.benchmark_path / config / filename
-
-        if not filepath.exists():
+        """Load one result using the shared canonical name or a legacy alias."""
+        candidates = [
+            self.benchmark_path / config / filename
+            for filename in calibration_result_filename_candidates(
+                config, workload, qps
+            )
+        ]
+        existing = [path for path in candidates if path.exists()]
+        if not existing:
             return None
+        filepath = existing[0]
+        if len(existing) > 1:
+            logger.warning(
+                "Multiple calibration files represent %s/%s/QPS=%s; using %s",
+                config,
+                workload,
+                qps,
+                filepath,
+            )
 
         try:
             with open(filepath, 'r') as f:
-                return json.load(f)
+                result = json.load(f)
         except Exception as e:
             logger.warning(f"Failed to load {filepath}: {e}")
             return None
+
+        expected = (config, workload, float(qps))
+        try:
+            actual = (
+                result.get("config"),
+                result.get("workload"),
+                float(result.get("qps")),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid calibration identity in %s", filepath)
+            return None
+        if actual != expected:
+            logger.warning(
+                "Calibration identity mismatch in %s: expected=%s actual=%s",
+                filepath,
+                expected,
+                actual,
+            )
+
+            return None
+        return result
 
     def _calculate_score(
         self,
@@ -352,7 +388,12 @@ class PPDDecisionEngine:
         # Log summary
         ppd_wins = sum(1 for v in self.lookup_table.values() if v)
         total = len(self.lookup_table)
-        logger.info(f"Lookup table built: PPD wins {ppd_wins}/{total} cases ({ppd_wins/total*100:.1f}%)")
+        loaded = len(self.performance_data)
+        logger.info(
+            "Lookup table built: loaded matched calibration pairs=%d/%d; "
+            "PPD decisions=%d/%d (%.1f%%, including defaults)",
+            loaded, total, ppd_wins, total, ppd_wins / total * 100,
+        )
 
     def _extrapolate_for_huge_context(
         self,
