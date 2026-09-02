@@ -285,63 +285,144 @@ def register_static_replicas():
             print(f"[PROXY] Add [R] HTTP:{http_addr} (static)")
 
 
-def estimate_token_count(text: str) -> int:
+def _message_value_text(value: Any) -> str:
+    """Return a stable textual representation for token estimation."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def estimate_token_count(text: Any) -> int:
     """Estimate token count from text (rough approximation: ~4 chars per token)."""
-    if not text:
+    serialized = _message_value_text(text)
+    if not serialized:
         return 0
-    return len(text) // 4
+    return len(serialized) // 4
 
 
-def extract_request_features(data: dict) -> Tuple[int, int, int]:
-    """Extract request features for PPD decision.
+def estimate_message_token_count(message: dict) -> int:
+    """Estimate one chat message, including structured tool-call payloads.
 
-    Returns:
-        (input_tokens, output_tokens, context_tokens)
-        - input_tokens: Estimated new tokens in current turn
-        - output_tokens: max_tokens parameter (expected output)
-        - context_tokens: Estimated tokens from conversation history
+    The estimate intentionally remains lightweight and tokenizer-free, matching
+    the original PPD proxy. Structured fields matter in agent transcripts: an
+    assistant tool call is reusable context, while tool_call_id/name and the
+    tool observation are part of the next append-prefill.
     """
-    # Get output tokens from max_tokens parameter
+    token_count = estimate_token_count(message.get("content"))
+    token_count += estimate_token_count(message.get("tool_calls"))
+    token_count += estimate_token_count(message.get("name"))
+    token_count += estimate_token_count(message.get("tool_call_id"))
+    # Approximate chat-template role/separator overhead.
+    return token_count + 4
+
+
+def _extract_request_features_with_metadata(
+    data: dict,
+) -> Tuple[int, int, int, Dict[str, Any]]:
+    """Extract PPD decision features plus profiling metadata.
+
+    For chat requests, the current append consists of every message after the
+    most recent assistant response. This supports both regular chat (the new
+    user message) and ReAct agents (one or more tool observations). Everything
+    through that assistant response is reusable accumulated context.
+    """
     output_tokens = data.get("max_tokens", 128)
     if "max_completion_tokens" in data:
         output_tokens = data.get("max_completion_tokens", output_tokens)
+    try:
+        output_tokens = max(0, int(output_tokens))
+    except (TypeError, ValueError):
+        output_tokens = 128
 
-    # Extract prompt/messages
     if "messages" in data:
-        messages = data.get("messages", [])
-        # Count context from previous messages
-        context_tokens = 0
-        current_input_tokens = 0
-        for i, msg in enumerate(messages):
-            content = msg.get("content", "")
-            tokens = estimate_token_count(content)
-            if i == len(messages) - 1 and msg.get("role") == "user":
-                current_input_tokens = tokens
-            else:
-                context_tokens += tokens
-        return current_input_tokens, output_tokens, context_tokens
-    else:
-        prompt = data.get("prompt", "")
-        if isinstance(prompt, list):
-            prompt = " ".join(str(p) for p in prompt)
+        messages = [msg for msg in (data.get("messages") or []) if isinstance(msg, dict)]
+        last_assistant = next(
+            (index for index in range(len(messages) - 1, -1, -1)
+             if messages[index].get("role") == "assistant"),
+            None,
+        )
 
-        # For continuation prompts, estimate based on "User:" markers
-        # The last "User:" section is the new input, everything before is context
-        if "User:" in prompt:
-            parts = prompt.rsplit("User:", 1)
-            if len(parts) == 2:
-                context_part = parts[0]
-                current_part = parts[1]
-                # Find where the current input ends (at "Assistant:" or end)
-                if "Assistant:" in current_part:
-                    current_part = current_part.split("Assistant:", 1)[0]
-                context_tokens = estimate_token_count(context_part)
-                current_input_tokens = estimate_token_count(current_part)
-                return current_input_tokens, output_tokens, context_tokens
+        if last_assistant is not None:
+            split_index = last_assistant + 1
+            source = "chat_after_last_assistant"
+        else:
+            # First turn: the latest user message is the new input; system and
+            # any preceding setup messages form its context.
+            last_user = next(
+                (index for index in range(len(messages) - 1, -1, -1)
+                 if messages[index].get("role") == "user"),
+                len(messages),
+            )
+            split_index = last_user
+            source = "chat_first_user_turn"
 
-        # Fallback: treat entire prompt as context + small input
-        total_tokens = estimate_token_count(prompt)
-        return min(total_tokens, 256), output_tokens, max(0, total_tokens - 256)
+        context_messages = messages[:split_index]
+        append_messages = messages[split_index:]
+        context_tokens = sum(estimate_message_token_count(msg) for msg in context_messages)
+        current_input_tokens = sum(estimate_message_token_count(msg) for msg in append_messages)
+        metadata = {
+            "feature_source": source,
+            "feature_token_estimator": "chars_per_4_with_chat_overhead_v1",
+            "last_message_role": messages[-1].get("role") if messages else None,
+            "append_message_roles": [msg.get("role") for msg in append_messages],
+        }
+        return current_input_tokens, output_tokens, context_tokens, metadata
+
+    prompt = data.get("prompt", "")
+    if isinstance(prompt, list):
+        prompt = " ".join(str(part) for part in prompt)
+
+    # For continuation prompts, estimate based on "User:" markers.
+    if "User:" in prompt:
+        parts = prompt.rsplit("User:", 1)
+        if len(parts) == 2:
+            context_part, current_part = parts
+            if "Assistant:" in current_part:
+                current_part = current_part.split("Assistant:", 1)[0]
+            return (
+                estimate_token_count(current_part),
+                output_tokens,
+                estimate_token_count(context_part),
+                {
+                    "feature_source": "completion_last_user_marker",
+                    "feature_token_estimator": "chars_per_4_v1",
+                    "last_message_role": None,
+                    "append_message_roles": [],
+                },
+            )
+
+    # Fallback: treat entire prompt as context plus a small input, preserving
+    # the original proxy behavior for legacy completion clients.
+    total_tokens = estimate_token_count(prompt)
+    return (
+        min(total_tokens, 256),
+        output_tokens,
+        max(0, total_tokens - 256),
+        {
+            "feature_source": "completion_fallback",
+            "feature_token_estimator": "chars_per_4_v1",
+            "last_message_role": None,
+            "append_message_roles": [],
+        },
+    )
+
+
+def extract_request_features(data: dict) -> Tuple[int, int, int]:
+    """Extract request features for the PPD decision engine.
+
+    Returns:
+        (input_tokens, output_tokens, context_tokens)
+        - input_tokens: estimated tokens appended since the latest assistant turn
+        - output_tokens: configured generation cap (current PPD-compatible proxy behavior)
+        - context_tokens: estimated reusable tokens through the latest assistant turn
+    """
+    input_tokens, output_tokens, context_tokens, _ = _extract_request_features_with_metadata(data)
+    return input_tokens, output_tokens, context_tokens
 
 
 def log_ppd_decision(
@@ -350,6 +431,7 @@ def log_ppd_decision(
     input_tokens: int,
     output_tokens: int,
     context_tokens: int,
+    current_qps: float,
     decision: bool,
     routing_mode: str,
 ):
@@ -363,6 +445,7 @@ def log_ppd_decision(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "context_tokens": context_tokens,
+        "current_qps": current_qps,
         "ppd_decision": decision,
         "actual_mode": routing_mode,
     }
@@ -625,6 +708,8 @@ async def handle_request():
     t_enter = time.time()
     t_prefill_done = None
     response_usage: Dict[str, Any] = {}
+    feature_metadata: Dict[str, Any] = {}
+    decision_qps_est = 0.0
     prefill_response_meta: Dict[str, Any] = {}
     decode_response_meta: Dict[str, Any] = {}
     profile_context = {
@@ -650,9 +735,19 @@ async def handle_request():
             "turn": turn_number,
             "conv": conv_hash[:8],
             "request_id": request_id,
+            # Backward-compatible aliases used by existing analyzers.
             "in_tokens": input_tokens,
             "out_tokens": output_tokens,
             "ctx_tokens": context_tokens,
+            # Explicit names distinguish decision-time estimates from the exact
+            # usage fields populated after vLLM tokenizes/generates the request.
+            "decision_input_tokens_est": input_tokens,
+            "decision_output_tokens_est": output_tokens,
+            "decision_context_tokens_est": context_tokens,
+            "decision_qps_est": decision_qps_est,
+            "ppd_mode_enabled": ENABLE_PPD_MODE,
+            "ppd_decision": ppd_decision,
+            **feature_metadata,
             "prefill_addr": prefill_addr,
             "decode_addr": decode_addr,
             "t_route_s": round(t_route - t_enter, 4),
@@ -680,15 +775,22 @@ async def handle_request():
         # Dynamic PPD decision
         use_ppd_dynamic = False
         ppd_decision = None
-        input_tokens, output_tokens, context_tokens = extract_request_features(data)
+        input_tokens, output_tokens, context_tokens, feature_metadata = (
+            _extract_request_features_with_metadata(data)
+        )
+
+        with stats_lock:
+            decision_qps_est = stats.get("total_requests", 0) / max(
+                1, time.time() - stats.get("start_time", time.time())
+            )
 
         if ENABLE_PPD_MODE and PPD_DECISION_ENGINE is not None:
-            # Call decision engine (returns False for Turn 1)
+            # Call decision engine (returns False for Turn 1).
             ppd_decision = PPD_DECISION_ENGINE.should_use_ppd(
                 turn=current_turn + 1,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                current_qps=stats.get("total_requests", 0) / max(1, time.time() - stats.get("start_time", time.time())),
+                current_qps=decision_qps_est,
                 context_tokens=context_tokens,
             )
             use_ppd_dynamic = ppd_decision
@@ -741,6 +843,7 @@ async def handle_request():
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 context_tokens=context_tokens,
+                current_qps=decision_qps_est,
                 decision=ppd_decision,
                 routing_mode=routing_mode,
             )

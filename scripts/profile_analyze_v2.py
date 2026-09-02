@@ -218,6 +218,125 @@ def tool_events(trace: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def sandbox_rpc_events(trace: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten non-overlapping raw provider events from a schema-v3 trace."""
+    events: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any, Any]] = set()
+
+    def add(raw_events: Any, *, scope: str, step: Any = None, tool_index: Any = None) -> None:
+        if not isinstance(raw_events, list):
+            return
+        for raw in raw_events:
+            if not isinstance(raw, dict):
+                continue
+            key = (raw.get("seq"), raw.get("kind"), raw.get("start_ts"))
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({
+                **raw,
+                "scope": scope,
+                "step": step,
+                "tool_index": tool_index,
+            })
+
+    profile = trace.get("sandbox_profile") or {}
+    add(profile.get("pre_agent_events"), scope="sandbox_start")
+    add((trace.get("toolbox_setup") or {}).get("sandbox_events"), scope="toolbox_setup")
+    for step in trace.get("steps_detail", []):
+        for tool in step.get("tools", []):
+            add(
+                tool.get("sandbox_events"),
+                scope="tool",
+                step=step.get("step"),
+                tool_index=tool.get("tool_index"),
+            )
+    return sorted(events, key=lambda event: float(event.get("start_ts") or 0))
+
+
+def sandbox_event_label(event: dict[str, Any]) -> str:
+    if event.get("kind") == "modal.exec":
+        return str(event.get("operation") or "modal.exec")
+    return str(event.get("kind") or "unknown")
+
+
+def stream_tail_s(event: dict[str, Any]) -> float:
+    """Approximate stream completion after process completion.
+
+    Modal stream reads and process.wait run concurrently, so stream-read time
+    must not be added to process-wait time. Only the positive tail is a useful
+    approximation of post-process output transfer/finalization.
+    """
+    stream = max(
+        float(event.get("stdout_read_s") or 0),
+        float(event.get("stderr_read_s") or 0),
+    )
+    return max(0.0, stream - float(event.get("process_wait_s") or 0))
+
+
+def tool_sandbox_breakdown(event: dict[str, Any]) -> str:
+    rows = [row for row in event.get("sandbox_events", []) if isinstance(row, dict)]
+    if not rows:
+        return "provider phases=unavailable"
+    rpc_total = sum(float(row.get("duration_s") or 0) for row in rows)
+    tool_total = float(event.get("time_s") or 0)
+    unattributed = max(0.0, tool_total - rpc_total)
+    tool_profile = event.get("tool_profile") or {}
+    remote_command = tool_profile.get("remote_command_s")
+    slow = max(rows, key=lambda row: float(row.get("duration_s") or 0))
+    detail = (
+        f"provider={rpc_total:.3f}s/{tool_total:.3f}s "
+        f"host_unattributed={unattributed:.3f}s "
+        f"slow_rpc={sandbox_event_label(slow)}:{float(slow.get('duration_s') or 0):.3f}s"
+    )
+    if isinstance(remote_command, (int, float)):
+        # Remote command time is nested inside one of the provider wait RPCs;
+        # subtract it only for this approximate decomposition, never add it to
+        # provider_total.
+        provider_noncommand = max(0.0, rpc_total - float(remote_command))
+        detail += (
+            f" remote_command={float(remote_command):.3f}s"
+            f" provider_noncommand~={provider_noncommand:.3f}s"
+        )
+    if slow.get("kind") == "modal.exec":
+        detail += (
+            f" submit={float(slow.get('submit_s') or 0):.3f}s"
+            f" wait={float(slow.get('process_wait_s') or 0):.3f}s"
+            f" stream_tail~={stream_tail_s(slow):.3f}s"
+        )
+    elif slow.get("bytes") is not None:
+        detail += f" bytes={int(slow['bytes'])}"
+    return detail
+
+
+def print_sandbox_rpc_summary(events: list[dict[str, Any]], title: str) -> None:
+    print(f"\n{title}:")
+    if not events:
+        print("  unavailable (requires a schema-v3 trace from the instrumented Modal sandbox)")
+        return
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        grouped[sandbox_event_label(event)].append(event)
+    print(
+        f"  {'phase':<24} {'count':>5} {'total_s':>9} {'p50_s':>8} "
+        f"{'p90_s':>8} {'max_s':>8} {'submit90':>9} {'wait90':>8} {'tail90~':>8}"
+    )
+    for phase, rows in sorted(
+        grouped.items(),
+        key=lambda item: -sum(float(row.get("duration_s") or 0) for row in item[1]),
+    ):
+        durations = [float(row.get("duration_s") or 0) for row in rows]
+        submits = [float(row.get("submit_s") or 0) for row in rows if row.get("kind") == "modal.exec"]
+        waits = [float(row.get("process_wait_s") or 0) for row in rows if row.get("kind") == "modal.exec"]
+        tails = [stream_tail_s(row) for row in rows if row.get("kind") == "modal.exec"]
+        fmt = lambda values: f"{percentile(values, .9):.3f}" if values else "-"
+        print(
+            f"  {phase:<24.24} {len(rows):>5} {sum(durations):>9.3f} "
+            f"{percentile(durations, .5):>8.3f} {percentile(durations, .9):>8.3f} "
+            f"{max(durations):>8.3f} {fmt(submits):>9} {fmt(waits):>8} {fmt(tails):>8}"
+        )
+
+
 def print_tool_operation_summary(events: list[dict[str, Any]], title: str) -> None:
     print(f"\n{title}:")
     if not events:
@@ -264,6 +383,22 @@ def response_kind(step: dict[str, Any]) -> str:
     if has_tools:
         return "tool"
     return "text" if content else "empty"
+
+
+def reusable_prefix_tokens(step: dict[str, Any]) -> float:
+    """Estimate the previous request's contiguous prefix present next turn.
+
+    Hidden reasoning is retained in the trace but not replayed into the API
+    transcript. That divergence means none of that completion is prefix-reusable.
+    """
+    prompt = float(step.get("prompt_tokens") or 0)
+    completion = float(step.get("completion_tokens") or 0)
+    if (
+        response_kind(step).startswith("think")
+        and not bool(step.get("reasoning_in_next_prompt", False))
+    ):
+        return prompt
+    return prompt + completion
 
 
 def cache_observation(
@@ -391,7 +526,8 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
             print(f"  WARNING: {warning}")
 
     print("\nPer-step LLM requests:")
-    print("  cache%=cached/prompt; retain%=cached/(previous prompt+response); "
+    print("  cache%=cached/prompt; retain%=cached/previous contiguous reusable prefix")
+    print("  hidden reasoning is excluded when it is not replayed; "
           "src xfer=P-to-pD KV transfer, local=pD prefix cache")
     print("  resp_tok=server usage.completion_tokens; includes text/reasoning/tool-call serialization")
     print(f"{'step':>4} {'route':>11} {'turn':>4} {'node':>5} {'phys':>4} {'llm_s':>7} "
@@ -405,12 +541,9 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         step_requests[step.get("step")] = requests
         prompt, cached, initial, retry = cache_observation(step, requests)
         hit = (100 * cached / prompt) if isinstance(cached, (int, float)) and prompt else None
-        reusable = 0
-        if previous_step:
-            reusable = (
-                float(previous_step.get("prompt_tokens") or 0)
-                + float(previous_step.get("completion_tokens") or 0)
-            )
+        reusable = (
+            reusable_prefix_tokens(previous_step) if previous_step else 0
+        )
         retention = (100 * cached / reusable) if isinstance(cached, (int, float)) and reusable else None
         node = str(initial.get("decode_addr") or "-").rsplit(":", 1)[-1]
         route = str(initial.get("route", "-"))
@@ -427,6 +560,44 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         )
         previous_step = step
 
+    dynamic_rows = [
+        requests[0]
+        for step in ordered_steps
+        if (requests := step_requests.get(step.get("step"), []))
+        and requests[0].get("ppd_decision") is not None
+    ]
+    if dynamic_rows:
+        ppd_count = sum(bool(row.get("ppd_decision")) for row in dynamic_rows)
+        qps_values = metric_values(dynamic_rows, "decision_qps_est")
+        input_estimates = metric_values(dynamic_rows, "decision_input_tokens_est")
+        output_estimates = metric_values(dynamic_rows, "decision_output_tokens_est")
+        context_estimates = metric_values(dynamic_rows, "decision_context_tokens_est")
+        actual_outputs = metric_values(dynamic_rows, "completion_tokens")
+        route_counts = Counter(str(row.get("route") or "unknown") for row in dynamic_rows)
+        feature_sources = Counter(str(row.get("feature_source") or "unknown") for row in dynamic_rows)
+        print("\nDynamic decisions:")
+        print(
+            f"  total={len(dynamic_rows)} ppd={ppd_count} pd={len(dynamic_rows) - ppd_count} "
+            f"routes={dict(route_counts)}"
+        )
+        if qps_values:
+            print(
+                f"  qps_est p50={statistics.median(qps_values):.3f} "
+                f"p90={percentile(qps_values, .9):.3f} max={max(qps_values):.3f}"
+            )
+        estimate_parts = []
+        for label, values in (
+            ("append", input_estimates), ("output_cap", output_estimates),
+            ("context", context_estimates), ("actual_output", actual_outputs),
+        ):
+            if values:
+                estimate_parts.append(
+                    f"{label}_p50={statistics.median(values):.0f} {label}_max={max(values):.0f}"
+                )
+        if estimate_parts:
+            print("  " + " | ".join(estimate_parts))
+        print(f"  feature_sources={dict(feature_sources)}")
+
     events = sorted(tool_events(trace), key=lambda event: event["time_s"], reverse=True)
     print("\nSlowest tool calls and server load during each call:")
     for event in events[:10]:
@@ -434,9 +605,13 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         print(
             f"  step={event['step']:>3} idx={event['tool_index']} "
             f"{str(event.get('operation')):>24} {event['time_s']:>8.3f}s "
-            f"status={event.get('status', 'legacy')} detail={event.get('detail') or '-'} | {load}"
+            f"status={event.get('status', 'legacy')} detail={event.get('detail') or '-'} | {load}\n"
+            f"    {tool_sandbox_breakdown(event)}"
         )
     print_tool_operation_summary(events, "Tool operation breakdown")
+    print_sandbox_rpc_summary(
+        sandbox_rpc_events(trace), "Modal lifecycle and RPC phase breakdown"
+    )
 
     print("\nTTL evidence (long tool pause -> next logical request cache retention):")
     if not events:
@@ -448,38 +623,51 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
             print(f"  step={event['step']} pause={event['time_s']:.3f}s -> no next request")
             continue
         requests = step_requests.get(next_step.get("step"), [])
-        next_prompt, cached, _, _ = cache_observation(next_step, requests)
+        next_prompt, cached, next_initial, _ = cache_observation(next_step, requests)
         previous_step = next(
             (step for step in steps if int(step.get("step", 0)) == int(event["step"])),
             {},
         )
-        reusable = (
-            float(previous_step.get("prompt_tokens") or 0)
-            + float(previous_step.get("completion_tokens") or 0)
-        )
+        reusable = reusable_prefix_tokens(previous_step)
         retention = cached / reusable if isinstance(cached, (int, float)) and reusable else None
         print(
             f"  step={event['step']} {event.get('name')} pause={event['time_s']:.3f}s "
             f"-> step={next_step.get('step')} cached={cached if cached is not None else 'unknown'} "
             f"reusable~={int(reusable) if reusable else 'unknown'} next_prompt={next_prompt or 'unknown'} "
-            f"retention={f'{retention:.1%}' if retention is not None else 'unknown'}"
+            f"retention={f'{retention:.1%}' if retention is not None else 'unknown'} "
+            f"next_route={next_initial.get('route') or 'unknown'}"
         )
     # Report material loss between consecutive logical requests. The 90%
     # threshold excludes normal cache-block alignment differences.
     print("\nCache loss events (retention < 90%):")
-    print(f"  {'steps':>7} {'node':>5} {'reusable':>9} {'cached':>8} {'lost':>8} "
-          f"{'retain':>7} {'other active episodes':>28} {'wait':>5} {'kv_max':>7} {'llm_s':>7}")
+    print(f"  {'steps':>7} {'route transition':>23} {'same':>4} {'node':>5} "
+          f"{'reusable':>9} {'cached':>8} {'lost':>8} {'retain':>7} {'interpretation':>20} "
+          f"{'other active episodes':>28} {'wait':>5} {'kv_max':>7} {'llm_s':>7}")
     loss_count = 0
     for previous_step, next_step in zip(ordered_steps, ordered_steps[1:]):
         requests = step_requests.get(next_step.get("step"), [])
         _, cached, initial, _ = cache_observation(next_step, requests)
-        reusable = float(previous_step.get("prompt_tokens") or 0) + float(previous_step.get("completion_tokens") or 0)
+        reusable = reusable_prefix_tokens(previous_step)
         if not reusable or not isinstance(cached, (int, float)):
             continue
         retention = float(cached) / reusable
         if retention >= 0.90:
             continue
+        previous_requests = step_requests.get(previous_step.get("step"), [])
+        _, _, previous_initial, _ = cache_observation(previous_step, previous_requests)
+        previous_route = str(previous_initial.get("route") or "unknown")
+        current_route = str(initial.get("route") or "unknown")
+        previous_node_addr = str(previous_initial.get("decode_addr") or "")
         node_addr = str(initial.get("decode_addr") or "")
+        same_node = bool(previous_node_addr and node_addr and previous_node_addr == node_addr)
+        if current_route == "pd":
+            interpretation = "policy_pd_recompute"
+        elif not same_node:
+            interpretation = "node_change"
+        elif current_route in ("ppd_dynamic", "ppd_direct"):
+            interpretation = "cache_loss_candidate"
+        else:
+            interpretation = "route_other"
         port = node_addr.rsplit(":", 1)[-1] if node_addr else "-"
         request_start = float(initial.get("ts_enter") or next_step.get("llm_start_ts") or 0)
         request_end = float(initial.get("ts_exit") or next_step.get("llm_end_ts") or request_start)
@@ -502,9 +690,11 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         lost = max(0, round(reusable - float(cached)))
         wait_text = f"{max(waiting):.0f}" if waiting else "?"
         kv_text = f"{max(cache):.1%}" if cache else "?"
-        print(f"  {int(previous_step.get('step', 0)):>3}->{int(next_step.get('step', 0)):<3} {port:>5} "
+        transition = f"{previous_route}->{current_route}"
+        print(f"  {int(previous_step.get('step', 0)):>3}->{int(next_step.get('step', 0)):<3} "
+              f"{transition:>23} {('yes' if same_node else 'no'):>4} {port:>5} "
               f"{int(reusable):>9} {int(cached):>8} {lost:>8} {retention:>7.1%} "
-              f"{active_text:>28} {wait_text:>5} {kv_text:>7} "
+              f"{interpretation:>20} {active_text:>28} {wait_text:>5} {kv_text:>7} "
               f"{float(next_step.get('llm_time_s') or 0):>7.2f}")
         loss_count += 1
     if not loss_count:
@@ -564,9 +754,14 @@ def main() -> int:
     for trace in traces:
         analyze_trace(trace, proxy, metrics)
     print("=" * 100)
+    all_tool_events = [event for trace in traces for event in tool_events(trace)]
     print_tool_operation_summary(
-        [event for trace in traces for event in tool_events(trace)],
+        all_tool_events,
         "Run-wide tool operation breakdown",
+    )
+    print_sandbox_rpc_summary(
+        [event for trace in traces for event in sandbox_rpc_events(trace)],
+        "Run-wide Modal lifecycle and RPC phase breakdown",
     )
     return 0
 
