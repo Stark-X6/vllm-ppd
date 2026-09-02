@@ -71,6 +71,7 @@ venv/
 # IDE
 .idea/
 .vscode/
+.ipynb_checkpoints/
 *.swp
 *.swo
 

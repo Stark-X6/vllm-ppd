@@ -93,6 +93,7 @@ CUDA_VISIBLE_DEVICES=0 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --max-model-len $MAX_MODEL_LEN \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
+    --dtype "$MODEL_DTYPE" --reasoning-parser "$REASONING_PARSER" \
     --enable-prompt-tokens-details \
     --enable-prefix-caching \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
@@ -107,6 +108,7 @@ CUDA_VISIBLE_DEVICES=1 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --max-model-len $MAX_MODEL_LEN \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
+    --dtype "$MODEL_DTYPE" --reasoning-parser "$REASONING_PARSER" \
     --enable-prompt-tokens-details \
     --enable-prefix-caching \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
@@ -121,6 +123,7 @@ CUDA_VISIBLE_DEVICES=2 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --max-model-len $MAX_MODEL_LEN \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
+    --dtype "$MODEL_DTYPE" --reasoning-parser "$REASONING_PARSER" \
     --enable-prompt-tokens-details \
     --enable-prefix-caching \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \
@@ -135,6 +138,7 @@ CUDA_VISIBLE_DEVICES=3 python -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
     --max-model-len $MAX_MODEL_LEN \
     --gpu-memory-utilization $GPU_MEMORY_UTIL \
     --trust-remote-code --disable-log-requests \
+    --dtype "$MODEL_DTYPE" --reasoning-parser "$REASONING_PARSER" \
     --enable-prompt-tokens-details \
     --enable-prefix-caching \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER" \

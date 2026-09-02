@@ -12,7 +12,7 @@
 # ============================================================================
 
 # Model path - set MODEL_PATH env var before sourcing this file
-export MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/Qwen3-32B}"
+export MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/Qwen3-30B-A3B-Thinking-2507}"
 
 # Qwen3-Coder uses its dedicated structured tool parser; dense Qwen3 uses Hermes.
 # TOOL_CALL_PARSER can still be overridden explicitly for another model.
@@ -24,12 +24,18 @@ if [ -z "${TOOL_CALL_PARSER:-}" ]; then
 fi
 export TOOL_CALL_PARSER
 
-# Model name for pkill (derived from MODEL_PATH if not set)
-export MODEL_NAME="${MODEL_NAME:-Llama-3.1-8B}"
+# Thinking parser: the generation prompt already contains <think>, so this
+# parser also handles generated text that starts inside the reasoning block.
+export REASONING_PARSER="${REASONING_PARSER:-deepseek_r1}"
+
+# Model name for logs/process matching (derived from MODEL_PATH if not set).
+export MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
 
 # Model settings (support environment variable override)
-export MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-155648}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
+export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
+
 
 # Conversation-hash salt: one per stack start, so re-running the same task
 # instance doesn't inherit turn counters / server affinity from a prior run.
