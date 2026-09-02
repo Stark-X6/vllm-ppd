@@ -118,6 +118,12 @@ PPD_DECISION_ENGINE = None
 PPD_DECISION_LOG: List[dict] = []  # Log of PPD decisions for analysis
 PPD_LOG_LOCK = threading.Lock()
 
+# Optional tokenizer used only for the newly appended message suffix. Encoding
+# the suffix avoids re-tokenizing a 100K+ context on every Agent turn.
+_FEATURE_TOKENIZER: Any = None
+_FEATURE_TOKENIZER_PATH: Optional[str] = None
+_FEATURE_TOKENIZER_ERROR: Optional[str] = None
+
 # Static configuration for replica ports (replicas don't use ZMQ registration)
 REPLICA_PORTS_BY_CONFIG = {
     "4R": [8300, 8400, 8500, 8600],
@@ -285,6 +291,128 @@ def register_static_replicas():
             print(f"[PROXY] Add [R] HTTP:{http_addr} (static)")
 
 
+def _template_token_count(
+    tokenizer: Any,
+    messages: List[dict],
+    *,
+    tools: Optional[List[dict]],
+    add_generation_prompt: bool,
+) -> int:
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        add_generation_prompt=add_generation_prompt,
+        tokenize=True,
+    )
+    if isinstance(token_ids, dict):
+        token_ids = token_ids.get("input_ids", [])
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    return len(token_ids)
+
+
+def _validate_suffix_tokenizer(tokenizer: Any) -> None:
+    """Prove that suffix-only tokenization matches full-template subtraction."""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "probe",
+            "description": "Probe tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    context = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "reason",
+            "tool_calls": [{
+                "id": "call-probe",
+                "type": "function",
+                "function": {"name": "probe", "arguments": "{}"},
+            }],
+        },
+    ]
+    append = [{
+        "role": "tool",
+        "tool_call_id": "call-probe",
+        "name": "probe",
+        "content": "result",
+    }]
+    full = _template_token_count(
+        tokenizer, context + append, tools=tools, add_generation_prompt=True
+    )
+    prefix = _template_token_count(
+        tokenizer, context, tools=tools, add_generation_prompt=False
+    )
+    suffix = _template_token_count(
+        tokenizer, append, tools=None, add_generation_prompt=True
+    )
+    if full - prefix != suffix:
+        raise ValueError(
+            "chat template is not suffix-additive for assistant/tool turns "
+            f"(full-prefix={full - prefix}, suffix={suffix})"
+        )
+
+
+def configure_feature_tokenizer(path: Optional[str]) -> bool:
+    """Load and validate the tokenizer used for exact append-token features."""
+    global _FEATURE_TOKENIZER, _FEATURE_TOKENIZER_PATH, _FEATURE_TOKENIZER_ERROR
+    _FEATURE_TOKENIZER = None
+    _FEATURE_TOKENIZER_PATH = path
+    _FEATURE_TOKENIZER_ERROR = None
+    if not path:
+        return False
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        if not getattr(tokenizer, "chat_template", None):
+            raise ValueError("tokenizer has no chat_template")
+        _validate_suffix_tokenizer(tokenizer)
+        _FEATURE_TOKENIZER = tokenizer
+        print(f"[PROXY] Exact append tokenizer enabled: {path}")
+        return True
+    except Exception as exc:
+        _FEATURE_TOKENIZER_ERROR = f"{type(exc).__name__}: {exc}"
+        print(
+            "[PROXY] WARNING: exact append tokenizer unavailable; "
+            f"falling back to chars/4: {_FEATURE_TOKENIZER_ERROR}"
+        )
+        return False
+
+
+def _exact_append_token_count(messages: List[dict]) -> Optional[int]:
+    """Tokenize only the suffix that is new after the latest assistant turn."""
+    global _FEATURE_TOKENIZER_ERROR
+    if _FEATURE_TOKENIZER is None:
+        return None
+    if not messages:
+        return 0
+    try:
+        return _template_token_count(
+            _FEATURE_TOKENIZER,
+            messages,
+            tools=None,
+            add_generation_prompt=True,
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if error != _FEATURE_TOKENIZER_ERROR:
+            print(
+                "[PROXY] WARNING: append suffix tokenization failed; "
+                f"falling back to chars/4 for this request: {error}"
+            )
+        _FEATURE_TOKENIZER_ERROR = error
+        return None
+
+
 def _message_value_text(value: Any) -> str:
     """Return a stable textual representation for token estimation."""
     if value is None:
@@ -314,6 +442,10 @@ def estimate_message_token_count(message: dict) -> int:
     tool observation are part of the next append-prefill.
     """
     token_count = estimate_token_count(message.get("content"))
+    reasoning = message.get("reasoning")
+    if reasoning is None:
+        reasoning = message.get("reasoning_content")
+    token_count += estimate_token_count(reasoning)
     token_count += estimate_token_count(message.get("tool_calls"))
     token_count += estimate_token_count(message.get("name"))
     token_count += estimate_token_count(message.get("tool_call_id"))
@@ -364,10 +496,30 @@ def _extract_request_features_with_metadata(
         context_messages = messages[:split_index]
         append_messages = messages[split_index:]
         context_tokens = sum(estimate_message_token_count(msg) for msg in context_messages)
-        current_input_tokens = sum(estimate_message_token_count(msg) for msg in append_messages)
+        fallback_input_tokens = sum(
+            estimate_message_token_count(msg) for msg in append_messages
+        )
+        exact_input_tokens = _exact_append_token_count(append_messages)
+        if exact_input_tokens is None:
+            current_input_tokens = fallback_input_tokens
+            token_estimator = "chars_per_4_with_chat_overhead_v1"
+        else:
+            current_input_tokens = exact_input_tokens
+            token_estimator = "hf_suffix_chat_template_v1"
+        last_assistant_message = (
+            messages[last_assistant] if last_assistant is not None else {}
+        )
         metadata = {
             "feature_source": source,
-            "feature_token_estimator": "chars_per_4_with_chat_overhead_v1",
+            "feature_token_estimator": token_estimator,
+            "context_token_estimator": "chars_per_4_with_chat_overhead_v1",
+            "feature_tokenizer_path": _FEATURE_TOKENIZER_PATH,
+            "feature_tokenizer_error": _FEATURE_TOKENIZER_ERROR,
+            "append_tokens_fallback_est": fallback_input_tokens,
+            "assistant_reasoning_replayed": bool(
+                last_assistant_message.get("reasoning")
+                or last_assistant_message.get("reasoning_content")
+            ),
             "last_message_role": messages[-1].get("role") if messages else None,
             "append_message_roles": [msg.get("role") for msg in append_messages],
         }
@@ -1109,6 +1261,13 @@ def main():
                         help="Weight for TTFT improvement in PPD decision (default: 1.0)")
     parser.add_argument("--w-tpot", type=float, default=1.0,
                         help="Weight for TPOT degradation penalty in PPD decision (default: 1.0)")
+    parser.add_argument(
+        "--feature-tokenizer-path",
+        type=str,
+        default=os.environ.get("PPD_FEATURE_TOKENIZER_PATH"),
+        help="Local tokenizer path for exact append-only Dynamic features; "
+             "falls back to chars/4 when unset or incompatible.",
+    )
 
     args = parser.parse_args()
     CONFIG_NAME = args.config
@@ -1123,6 +1282,8 @@ def main():
     print(f"[PROXY] Decode ports: D={d_ports}, pD={ppd_ports}")
     print(f"[PROXY] HTTP: {args.host}:{args.http_port}")
     print(f"[PROXY] ZMQ: {args.host}:{args.zmq_port}")
+
+    configure_feature_tokenizer(args.feature_tokenizer_path)
 
     # Initialize dynamic PPD mode if enabled
     if args.enable_ppd_mode:

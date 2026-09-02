@@ -36,6 +36,10 @@ export MAX_MODEL_LEN="${MAX_MODEL_LEN:-155648}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.97}"
 export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 
+# The proxy tokenizes only the new tool/user suffix with the same chat template
+# as vLLM. Set this empty to retain the legacy chars/4 estimator.
+export PPD_FEATURE_TOKENIZER_PATH="${PPD_FEATURE_TOKENIZER_PATH:-$MODEL_PATH}"
+
 
 # Conversation-hash salt: one per stack start, so re-running the same task
 # instance doesn't inherit turn counters / server affinity from a prior run.

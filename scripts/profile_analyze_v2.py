@@ -575,6 +575,18 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         actual_outputs = metric_values(dynamic_rows, "completion_tokens")
         route_counts = Counter(str(row.get("route") or "unknown") for row in dynamic_rows)
         feature_sources = Counter(str(row.get("feature_source") or "unknown") for row in dynamic_rows)
+        feature_estimators = Counter(
+            str(row.get("feature_token_estimator") or "unknown") for row in dynamic_rows
+        )
+        append_estimator_deltas = [
+            float(row["decision_input_tokens_est"])
+            - float(row["append_tokens_fallback_est"])
+            for row in dynamic_rows
+            if isinstance(row.get("decision_input_tokens_est"), (int, float))
+            and isinstance(row.get("append_tokens_fallback_est"), (int, float))
+            and row.get("feature_token_estimator") == "hf_suffix_chat_template_v1"
+        ]
+        later_turn_rows = [row for row in dynamic_rows if int(row.get("turn") or 0) > 1]
         print("\nDynamic decisions:")
         print(
             f"  total={len(dynamic_rows)} ppd={ppd_count} pd={len(dynamic_rows) - ppd_count} "
@@ -596,7 +608,21 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
                 )
         if estimate_parts:
             print("  " + " | ".join(estimate_parts))
-        print(f"  feature_sources={dict(feature_sources)}")
+        print(
+            f"  feature_sources={dict(feature_sources)} "
+            f"feature_estimators={dict(feature_estimators)}"
+        )
+        if append_estimator_deltas:
+            print(
+                "  exact_append_minus_fallback "
+                f"p50={statistics.median(append_estimator_deltas):.0f} "
+                f"p90={percentile(append_estimator_deltas, .9):.0f} "
+                f"min={min(append_estimator_deltas):.0f} "
+                f"max={max(append_estimator_deltas):.0f}"
+            )
+        if later_turn_rows:
+            replayed = sum(bool(row.get("assistant_reasoning_replayed")) for row in later_turn_rows)
+            print(f"  assistant_reasoning_replayed={replayed}/{len(later_turn_rows)} later turns")
 
     events = sorted(tool_events(trace), key=lambda event: event["time_s"], reverse=True)
     print("\nSlowest tool calls and server load during each call:")
