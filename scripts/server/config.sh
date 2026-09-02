@@ -38,7 +38,7 @@ export MODEL_DTYPE="${MODEL_DTYPE:-bfloat16}"
 
 # The proxy tokenizes only the new tool/user suffix with the same chat template
 # as vLLM. Set this empty to retain the legacy chars/4 estimator.
-export PPD_FEATURE_TOKENIZER_PATH="${PPD_FEATURE_TOKENIZER_PATH:-$MODEL_PATH}"
+export PPD_FEATURE_TOKENIZER_PATH="${PPD_FEATURE_TOKENIZER_PATH-$MODEL_PATH}"
 
 
 # Conversation-hash salt: one per stack start, so re-running the same task
