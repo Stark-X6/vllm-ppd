@@ -45,6 +45,17 @@ export PPD_FEATURE_TOKENIZER_PATH="${PPD_FEATURE_TOKENIZER_PATH-$MODEL_PATH}"
 # instance doesn't inherit turn counters / server affinity from a prior run.
 export PPD_PROXY_EPOCH="${PPD_PROXY_EPOCH:-$(date +%s)}"
 
+# Matched-run routing contract. A checked-in map can be supplied per
+# experiment with PPD_ROUTING_MAP_PATH and made fail-closed with strict=true.
+export PPD_ROUTING_MODE="${PPD_ROUTING_MODE:-stable_hash}"
+export PPD_ROUTING_SEED="${PPD_ROUTING_SEED:-agentic-ppd-v1}"
+export PPD_ROUTING_MAP_PATH="${PPD_ROUTING_MAP_PATH:-}"
+export PPD_ROUTING_MAP_STRICT="${PPD_ROUTING_MAP_STRICT:-false}"
+
+# Ask vLLM for response-time waiting/KV gauges in ORCA headers. The metrics
+# poller remains the source for arrival-window and maximum load.
+export PPD_ENABLE_ORCA_HEADERS="${PPD_ENABLE_ORCA_HEADERS:-true}"
+
 # Project directory
 export PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 

@@ -46,6 +46,7 @@ from vllm.entrypoints.openai.protocol import (
     DeltaMessage,
     DeltaToolCall,
     ErrorResponse,
+    PPDRequestMetrics,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ToolCall,
@@ -77,6 +78,53 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+
+
+def _build_ppd_request_metrics(
+    final_res: RequestOutput,
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    requested_max_tokens: int | None,
+) -> PPDRequestMetrics:
+    """Translate RequestStateStats into the public PPD timing contract."""
+    metrics = final_res.metrics
+
+    def elapsed(end: float, start: float) -> float | None:
+        if end <= 0.0 or start <= 0.0:
+            return None
+        return max(0.0, end - start)
+
+    queue_s = prefill_s = decode_s = inference_s = ttft_s = None
+    preemptions = 0
+    if metrics is not None and hasattr(metrics, "scheduled_ts"):
+        queue_s = elapsed(metrics.scheduled_ts, metrics.queued_ts)
+        prefill_s = elapsed(metrics.first_token_ts, metrics.scheduled_ts)
+        decode_s = elapsed(metrics.last_token_ts, metrics.first_token_ts)
+        inference_s = elapsed(metrics.last_token_ts, metrics.scheduled_ts)
+        ttft_s = max(0.0, float(metrics.first_token_latency))
+        preemptions = int(getattr(metrics, "num_preemptions", 0))
+
+    e2e_s = ttft_s + decode_s if ttft_s is not None and decode_s is not None else None
+    frontend_s = None
+    if ttft_s is not None and queue_s is not None and prefill_s is not None:
+        frontend_s = max(0.0, ttft_s - queue_s - prefill_s)
+    cached = int(final_res.num_cached_tokens or 0)
+    return PPDRequestMetrics(
+        queue_s=queue_s,
+        prefill_elapsed_s=prefill_s,
+        decode_elapsed_s=decode_s,
+        inference_elapsed_s=inference_s,
+        ttft_s=ttft_s,
+        e2e_s=e2e_s,
+        frontend_overhead_s=frontend_s,
+        num_preemptions=preemptions,
+        prompt_tokens=prompt_tokens,
+        cached_prompt_tokens=cached,
+        uncached_prompt_tokens=max(0, prompt_tokens - cached),
+        completion_tokens=completion_tokens,
+        requested_max_tokens=requested_max_tokens,
+    )
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -1653,6 +1701,11 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        requested_max_tokens = (
+            request.max_completion_tokens
+            if request.max_completion_tokens is not None
+            else request.max_tokens
+        )
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1664,6 +1717,12 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            ppd_request_metrics=_build_ppd_request_metrics(
+                final_res,
+                prompt_tokens=num_prompt_tokens,
+                completion_tokens=num_generated_tokens,
+                requested_max_tokens=requested_max_tokens,
+            ),
         )
 
         # Log complete response if output logging is enabled

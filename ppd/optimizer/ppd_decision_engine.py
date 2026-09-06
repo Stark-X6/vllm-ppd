@@ -425,6 +425,107 @@ class PPDDecisionEngine:
         # Fallback to default
         return self.default_use_ppd
 
+    def decide_with_metadata(
+        self,
+        turn: int,
+        input_tokens: int,
+        output_tokens: int,
+        current_qps: float,
+        context_tokens: int = 0,
+    ) -> Tuple[bool, dict]:
+        """Return the original decision plus an auditable explanation.
+
+        This method deliberately preserves ``should_use_ppd`` behavior.  The
+        metadata only exposes which bypass/default/calibration path supplied
+        the answer and which offline cell was selected.
+        """
+        ctx_class = classify_context_length(context_tokens)
+        workload_type = classify_workload(input_tokens, output_tokens)
+        nearest_qps = find_nearest_qps(current_qps)
+        metadata = {
+            "decision_source": None,
+            "context_class": ctx_class,
+            "workload_type": workload_type,
+            "requested_qps": current_qps,
+            "selected_qps": nearest_qps,
+            "selected_calibration_cell": None,
+            "calibration_pair_available": False,
+            "bypass_threshold": int(os.environ.get("PPD_BYPASS_THRESHOLD", "512")),
+            "base_config": self.base_config,
+            "ppd_config": self.ppd_config,
+        }
+
+        if turn == 1:
+            self.stats.record("turn1", False, is_turn1=True)
+            metadata["decision_source"] = "turn1_forced_pd"
+            return False, metadata
+
+        bypass_threshold = metadata["bypass_threshold"]
+        if input_tokens < bypass_threshold:
+            self.stats.record("short_input_bypass", True)
+            metadata["decision_source"] = "short_append_bypass"
+            logger.debug(
+                "PPD decision: turn=%s, input_tokens=%s < %s, bypass to PPD",
+                turn,
+                input_tokens,
+                bypass_threshold,
+            )
+            return True, metadata
+
+        selected_context = ctx_class
+        key = (ctx_class, workload_type, nearest_qps)
+        performance = None
+        if key in self.lookup_table:
+            use_ppd = self.lookup_table[key]
+            performance = self.performance_data.get(key)
+            if performance is None:
+                source = "default_missing_calibration_pair"
+            elif performance.get("score") == float("inf"):
+                source = "pd_calibration_failed_forced_ppd"
+            else:
+                source = "matched_calibration_score"
+        elif ctx_class == "huge":
+            selected_context = "large"
+            selected_key = (selected_context, workload_type, nearest_qps)
+            performance = self.performance_data.get(selected_key)
+            use_ppd = self._extrapolate_for_huge_context(workload_type, nearest_qps)
+            source = (
+                "huge_context_extrapolated_from_large"
+                if performance is not None
+                else "huge_context_default_missing_calibration"
+            )
+            logger.debug("Extrapolated decision for huge context: %s", use_ppd)
+        else:
+            use_ppd = self.default_use_ppd
+            source = "default_missing_lookup_key"
+
+        metadata["decision_source"] = source
+        metadata["selected_calibration_cell"] = {
+            "context_class": selected_context,
+            "workload_type": workload_type,
+            "qps": nearest_qps,
+        }
+        metadata["calibration_pair_available"] = performance is not None
+        if performance is not None:
+            metadata["calibration_metrics"] = {
+                key: (None if value == float("inf") else value)
+                for key, value in performance.items()
+            }
+
+        self.stats.record(workload_type, use_ppd)
+        logger.debug(
+            "PPD decision: turn=%s, ctx=%s, workload=%s, qps=%s->%s, "
+            "source=%s, decision=%s",
+            turn,
+            ctx_class,
+            workload_type,
+            current_qps,
+            nearest_qps,
+            source,
+            "PPD" if use_ppd else "PD",
+        )
+        return use_ppd, metadata
+
     def should_use_ppd(
         self,
         turn: int,
@@ -433,65 +534,15 @@ class PPDDecisionEngine:
         current_qps: float,
         context_tokens: int = 0,
     ) -> bool:
-        """Decide whether to use PPD mode for this request.
-
-        Args:
-            turn: Turn number (1, 2, 3, ...)
-            input_tokens: Number of input tokens in current turn
-            output_tokens: Number of expected output tokens (from ShareGPT)
-            current_qps: Current system QPS
-            context_tokens: Total tokens from previous turns (for Turn 2+)
-
-        Returns:
-            True if PPD mode should be used, False for PD mode
-        """
-        # Turn 1 always uses PD (need initial KV transfer)
-        if turn == 1:
-            self.stats.record("turn1", False, is_turn1=True)
-            return False
-
-        # Short append-prefill bypass: when new input tokens are small,
-        # the TPOT degradation from local processing is negligible.
-        # Threshold configurable via PPD_BYPASS_THRESHOLD env var (default 512).
-        # - <128 tokens: <2% TPOT degradation (chatbot workloads)
-        # - 128-512 tokens: 2-20% TPOT degradation (moderate)
-        # - >512 tokens: >20% TPOT degradation (heavy, route to P)
-        bypass_threshold = int(os.environ.get("PPD_BYPASS_THRESHOLD", "512"))
-        if input_tokens < bypass_threshold:
-            self.stats.record("short_input_bypass", True)
-            logger.debug(
-                f"PPD decision: turn={turn}, input_tokens={input_tokens} < {bypass_threshold}, "
-                f"bypass to PPD (short append-prefill)"
-            )
-            return True
-
-        # Classify the request
-        ctx_class = classify_context_length(context_tokens)
-        workload_type = classify_workload(input_tokens, output_tokens)
-        nearest_qps = find_nearest_qps(current_qps)
-
-        # Look up decision
-        key = (ctx_class, workload_type, nearest_qps)
-
-        if key in self.lookup_table:
-            use_ppd = self.lookup_table[key]
-        elif ctx_class == "huge":
-            # Extrapolate for huge context
-            use_ppd = self._extrapolate_for_huge_context(workload_type, nearest_qps)
-            logger.debug(f"Extrapolated decision for huge context: {use_ppd}")
-        else:
-            use_ppd = self.default_use_ppd
-
-        # Record for statistics
-        self.stats.record(workload_type, use_ppd)
-
-        logger.debug(
-            f"PPD decision: turn={turn}, ctx={ctx_class}, "
-            f"workload={workload_type}, qps={current_qps}->{nearest_qps}, "
-            f"decision={'PPD' if use_ppd else 'PD'}"
+        """Backward-compatible boolean API for benchmark and legacy callers."""
+        decision, _ = self.decide_with_metadata(
+            turn=turn,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            current_qps=current_qps,
+            context_tokens=context_tokens,
         )
-
-        return use_ppd
+        return decision
 
     def get_decision_stats(self) -> dict:
         """Get statistics about decisions made."""

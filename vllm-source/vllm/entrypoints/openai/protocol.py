@@ -173,6 +173,31 @@ class UsageInfo(OpenAIBaseModel):
     prompt_tokens_details: PromptTokenUsageInfo | None = None
 
 
+class PPDRequestMetrics(OpenAIBaseModel):
+    """vLLM request-level timing extension used by PPD profiling.
+
+    Engine phase durations use the engine-core monotonic clock. ``prefill`` is
+    elapsed time from first scheduling to first generated token, so it includes
+    prompt computation/recomputation and any stalls or preemptions in that
+    interval; it is not claimed to be pure GPU kernel time.
+    """
+
+    schema_version: Literal[1] = 1
+    queue_s: float | None = None
+    prefill_elapsed_s: float | None = None
+    decode_elapsed_s: float | None = None
+    inference_elapsed_s: float | None = None
+    ttft_s: float | None = None
+    e2e_s: float | None = None
+    frontend_overhead_s: float | None = None
+    num_preemptions: int = 0
+    prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    uncached_prompt_tokens: int = 0
+    completion_tokens: int = 0
+    requested_max_tokens: int | None = None
+
+
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: UsageInfo | None = None
@@ -1516,6 +1541,10 @@ class ChatCompletionResponse(OpenAIBaseModel):
     prompt_token_ids: list[int] | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
+    )
+    ppd_request_metrics: PPDRequestMetrics | None = Field(
+        default=None,
+        description="Per-request phase/tokens extension for PPD experiments.",
     )
 
 

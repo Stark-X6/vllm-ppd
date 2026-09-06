@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +43,8 @@ from quart import Quart, request, Response
 # Add project root to path for optimizer imports
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_DIR)
+
+from ppd.routing_contract import ROUTING_MODES, RoutingContract
 
 
 # ---- PPD profiling: per-request timing trace (JSONL) ----
@@ -90,11 +93,29 @@ replica_cv = threading.Condition()
 # Key: conv_hash, Value: (turn_count, last_access, assigned_servers)
 # assigned_servers: {"prefill": addr, "decode": addr, "replica": addr}
 conversation_state: Dict[str, Tuple[int, float, Dict[str, str]]] = {}
+# Key: (state_key, client_request_id). A record freezes the logical turn,
+# decision and server assignment across transport/tool-choice retries.
+logical_request_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
 conversation_lock = threading.Lock()
+
+# In-flight proxy counters are request-level (not TTL-resident episode counts).
+active_request_lock = threading.Lock()
+active_requests_by_phase: Dict[str, int] = defaultdict(int)
+active_decode_requests: Dict[str, int] = defaultdict(int)
+active_prefill_requests: Dict[str, int] = defaultdict(int)
+active_decode_conversations: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+# Logical arrivals support both the paper-compatible lifetime average and
+# observable sliding-window rates. Entries older than 60 seconds are pruned.
+logical_arrivals: deque[float] = deque()
 
 # Statistics
 stats = {
+    # Backward-compatible total now means logical requests, not HTTP attempts.
     "total_requests": 0,
+    "logical_requests": 0,
+    "physical_requests": 0,
+    "retry_requests": 0,
     "turn1_requests": 0,
     "turn2plus_requests": 0,
     "pd_requests": 0,
@@ -111,6 +132,9 @@ stats_lock = threading.Lock()
 CONFIG_NAME = "2P_2D"
 CONVERSATION_TTL = 3600
 DEFAULT_PING_SECONDS = 5
+
+# Stable by default. ``legacy_hash`` exists only to reproduce pre-fix runs.
+ROUTING_CONTRACT = RoutingContract()
 
 # Dynamic PPD mode configuration
 ENABLE_PPD_MODE = False
@@ -586,6 +610,7 @@ def log_ppd_decision(
     current_qps: float,
     decision: bool,
     routing_mode: str,
+    decision_metadata: Optional[Dict[str, Any]] = None,
 ):
     """Log a PPD decision for later analysis."""
     global PPD_DECISION_LOG
@@ -600,6 +625,11 @@ def log_ppd_decision(
         "current_qps": current_qps,
         "ppd_decision": decision,
         "actual_mode": routing_mode,
+        "decision_source": (decision_metadata or {}).get("decision_source"),
+        "selected_calibration_cell": (decision_metadata or {}).get(
+            "selected_calibration_cell"
+        ),
+        "decision_metadata": dict(decision_metadata or {}),
     }
 
     with PPD_LOG_LOCK:
@@ -612,37 +642,56 @@ def log_ppd_decision(
 def get_conversation_hash(
     data: dict, *, conversation_id: Optional[str] = None, run_id: Optional[str] = None
 ) -> str:
-    """Generate a hash to identify a conversation."""
+    """Generate the run-scoped state key for turn count/cache affinity."""
     if conversation_id:
         history_str = f"{run_id or 'unscoped'}|{conversation_id}"
     elif "messages" in data:
         messages = data.get("messages", [])
-        first_user = next((m for m in messages if m.get("role") == "user"), None)
-        if first_user:
-            history_str = first_user.get("content", "")
-        else:
-            history_str = ""
+        first_user = next(
+            (message for message in messages
+             if isinstance(message, dict) and message.get("role") == "user"),
+            None,
+        )
+        history_str = _message_value_text(first_user.get("content")) if first_user else ""
     else:
         prompt = data.get("prompt", "")
         if isinstance(prompt, list):
-            prompt = " ".join(str(p) for p in prompt)
-
+            prompt = " ".join(str(part) for part in prompt)
         if "User:" in prompt:
             start = prompt.find("User:")
             end = prompt.find("Assistant:", start)
-            if end > start:
-                history_str = prompt[start:end].strip()
-            else:
-                history_str = prompt[start:start+200]
+            history_str = prompt[start:end].strip() if end > start else prompt[start:start + 200]
         else:
             history_str = prompt[:200]
 
-    # PPD experiment: salt the hash so back-to-back runs of the same task
-    # instance (identical first user message) don't collide on the in-memory
-    # turn counter / server affinity. Set PPD_PROXY_EPOCH once per stack start.
-    history_str += os.environ.get("PPD_PROXY_EPOCH", "")
+    # State must be isolated across stack epochs; assignment must not be. The
+    # latter is handled separately by get_routing_identity/RoutingContract.
+    epoch = os.environ.get("PPD_PROXY_EPOCH", "")
+    return hashlib.md5(f"{history_str}|epoch={epoch}".encode()).hexdigest()
 
-    return hashlib.md5(history_str.encode()).hexdigest()
+
+def get_routing_identity(
+    data: dict, *, explicit_routing_key: Optional[str] = None
+) -> Tuple[str, str]:
+    """Return a cross-run assignment key and its provenance.
+
+    Instrumented agents send SWE instance_id + rollout index explicitly. The
+    first-user/prompt fallback is deterministic for legacy clients, but cannot
+    be used with a strict frozen map unless that exact key is present.
+    """
+    if explicit_routing_key:
+        return str(explicit_routing_key), "header"
+    if "messages" in data:
+        messages = data.get("messages") or []
+        first_user = next(
+            (message for message in messages
+             if isinstance(message, dict) and message.get("role") == "user"),
+            None,
+        )
+        if first_user is not None:
+            return _message_value_text(first_user.get("content")), "first_user_fallback"
+    prompt = data.get("prompt", "")
+    return _message_value_text(prompt), "prompt_fallback"
 
 
 def get_conversation_info(conv_hash: str) -> Tuple[int, Dict[str, str]]:
@@ -654,32 +703,114 @@ def get_conversation_info(conv_hash: str) -> Tuple[int, Dict[str, str]]:
         return 0, {}
 
 
+def _cleanup_conversation_state(current_time: float) -> None:
+    expired = [
+        key for key, value in conversation_state.items()
+        if current_time - value[1] > CONVERSATION_TTL
+    ]
+    for key in expired:
+        del conversation_state[key]
+        for request_key in [item for item in logical_request_state if item[0] == key]:
+            del logical_request_state[request_key]
+
+
 def update_conversation(
     conv_hash: str,
-    assigned: Optional[Dict[str, str]] = None
+    assigned: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Dict[str, str]]:
-    """Update conversation state and return new turn number."""
+    """Advance one *logical* conversation turn and return its assignment."""
     with conversation_lock:
-        # Clean up expired conversations
         current_time = time.time()
-        expired = [k for k, v in conversation_state.items()
-                   if current_time - v[1] > CONVERSATION_TTL]
-        for k in expired:
-            del conversation_state[k]
-
+        _cleanup_conversation_state(current_time)
         if conv_hash in conversation_state:
             turn_count, _, existing_assigned = conversation_state[conv_hash]
             turn_count += 1
-            # Merge new assignments with existing
+            final_assigned = existing_assigned.copy()
             if assigned:
-                existing_assigned.update(assigned)
-            final_assigned = existing_assigned
+                final_assigned.update(assigned)
         else:
             turn_count = 1
-            final_assigned = assigned or {}
-
+            final_assigned = dict(assigned or {})
         conversation_state[conv_hash] = (turn_count, current_time, final_assigned)
-        return turn_count, final_assigned
+        return turn_count, final_assigned.copy()
+
+
+def get_logical_request(
+    conv_hash: str, client_request_id: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Return and touch a previously frozen route for an HTTP retry."""
+    if not client_request_id:
+        return None
+    with conversation_lock:
+        _cleanup_conversation_state(time.time())
+        record = logical_request_state.get((conv_hash, client_request_id))
+        if record is None:
+            return None
+        record["last_access"] = time.time()
+        record["physical_attempts"] = int(record.get("physical_attempts", 1)) + 1
+        result = dict(record)
+        result["assigned"] = dict(record.get("assigned") or {})
+        result["routing_metadata"] = dict(record.get("routing_metadata") or {})
+        result["decision_metadata"] = dict(record.get("decision_metadata") or {})
+        result["decision_rate"] = dict(record.get("decision_rate") or {})
+        return result
+
+
+def save_logical_request(
+    conv_hash: str, client_request_id: Optional[str], record: Dict[str, Any]
+) -> None:
+    if not client_request_id:
+        return
+    stored = dict(record)
+    stored["last_access"] = time.time()
+    stored["physical_attempts"] = 1
+    stored["assigned"] = dict(record.get("assigned") or {})
+    stored["routing_metadata"] = dict(record.get("routing_metadata") or {})
+    stored["decision_metadata"] = dict(record.get("decision_metadata") or {})
+    stored["decision_rate"] = dict(record.get("decision_rate") or {})
+    with conversation_lock:
+        logical_request_state[(conv_hash, client_request_id)] = stored
+
+
+def record_request_arrival(now: float, *, is_logical: bool) -> Dict[str, Any]:
+    """Record one physical attempt and return explicitly-defined QPS views."""
+    with stats_lock:
+        stats["physical_requests"] += 1
+        if not is_logical:
+            stats["retry_requests"] += 1
+        started = float(stats.get("start_time") or now)
+        elapsed = max(1.0, now - started)
+        logical_before = int(stats.get("logical_requests", 0))
+        # Preserve the original Dynamic input: prior logical requests divided
+        # by proxy uptime (with the original one-second minimum denominator).
+        decision_qps = logical_before / elapsed
+        if is_logical:
+            stats["logical_requests"] = logical_before + 1
+            stats["total_requests"] = logical_before + 1
+            logical_arrivals.append(now)
+        cutoff = now - 60.0
+        while logical_arrivals and logical_arrivals[0] < cutoff:
+            logical_arrivals.popleft()
+        result: Dict[str, Any] = {
+            "decision_qps_est": decision_qps,
+            "decision_qps_source": "prior_logical_requests/proxy_uptime_min_1s",
+            "decision_qps_numerator": logical_before,
+            "decision_qps_denominator_s": elapsed,
+            "logical_lifetime_qps": int(stats.get("logical_requests", 0)) / elapsed,
+        }
+        for window in (1, 5, 10, 60):
+            count = sum(timestamp >= now - window for timestamp in logical_arrivals)
+            denominator = max(1e-6, min(float(window), max(now - started, 1e-6)))
+            result[f"logical_window_qps_{window}s"] = count / denominator
+            result[f"logical_window_count_{window}s"] = count
+        return result
+
+
+def _record_affinity(
+    metadata: Dict[str, Any], role: str, address: str, candidates: List[str]
+) -> None:
+    metadata[f"{role}_slot"] = candidates.index(address)
+    metadata[f"{role}_assignment_source"] = "conversation_affinity"
 
 
 def select_servers(
@@ -687,185 +818,293 @@ def select_servers(
     current_turn: int,
     assigned: Dict[str, str],
     use_ppd_dynamic: bool = False,
-) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
-    """
-    Select servers based on configuration and cache affinity.
-
-    Args:
-        conv_hash: Conversation hash for cache affinity
-        current_turn: Current turn number (1, 2, 3, ...)
-        assigned: Previously assigned servers for this conversation
-        use_ppd_dynamic: If True, enable PPD mode for Turn 2+ even on D servers
-                         (determined by PPD decision engine)
-
-    Returns: (prefill_addr, decode_addr, replica_addr, routing_mode)
-    routing_mode: "pd", "ppd", "ppd_direct", "ppd_dynamic", "replica"
-    - "pd": Standard prefill-decode mode with KV transfer every turn
-    - "ppd": PPD mode Turn 1 (KV transfer to pD server)
-    - "ppd_direct": PPD mode Turn 2+ (direct to pD, uses prefix cache)
-    - "ppd_dynamic": Dynamic PPD mode (Turn 2+ direct to D, decision engine enabled)
-    - "replica": Request routed to replica server
-
-    Routing Strategy:
-    1. Pure Replica (4R): All requests to replica, hash-based selection
-    2. Pure Disagg (1P_3D, 2P_2pD, etc.): All requests through P->D/pD
-    3. Hybrid (1R_1P_2pD, etc.): Distribute requests between replica and disagg
-       - Use conversation hash to deterministically assign mode
-       - Once assigned, cache affinity keeps same mode for Turn 2+
-    4. Dynamic PPD: When enabled, Turn 2+ requests can bypass prefill even on D servers
-    """
+    *,
+    routing_key: Optional[str] = None,
+    include_metadata: bool = False,
+):
+    """Select sorted server slots using the configured routing contract."""
+    key = routing_key or conv_hash
     prefill_addr = None
     decode_addr = None
     replica_addr = None
     routing_mode = "pd"
 
-    # Check available instances
     with prefill_cv:
-        prefill_list = list(prefill_instances.keys())
+        prefill_list = ROUTING_CONTRACT.candidate_addresses(prefill_instances.keys())
     with decode_cv:
-        decode_list = list(decode_instances.keys())
+        decode_list = ROUTING_CONTRACT.candidate_addresses(decode_instances.keys())
     with ppd_decode_cv:
-        ppd_list = list(ppd_decode_instances.keys())
+        ppd_list = ROUTING_CONTRACT.candidate_addresses(ppd_decode_instances.keys())
     with replica_cv:
-        replica_list = list(replica_instances.keys())
+        replica_list = ROUTING_CONTRACT.candidate_addresses(replica_instances.keys())
+    all_decode = ROUTING_CONTRACT.candidate_addresses(decode_list + ppd_list)
 
-    has_prefill = len(prefill_list) > 0
-    has_decode = len(decode_list) > 0 or len(ppd_list) > 0
-    has_replica = len(replica_list) > 0
+    metadata: Dict[str, Any] = {
+        "routing_contract_version": ROUTING_CONTRACT.descriptor()["contract_version"],
+        "routing_mode_config": ROUTING_CONTRACT.mode,
+        "routing_seed": ROUTING_CONTRACT.seed,
+        "routing_map_fingerprint_sha256": ROUTING_CONTRACT.map_fingerprint,
+        "routing_key_sha256": ROUTING_CONTRACT.key_hash(key),
+        "prefill_candidates": prefill_list,
+        "decode_candidates": all_decode,
+        "replica_candidates": replica_list,
+    }
 
-    # Check if this conversation already has an assigned mode
+    def choose(candidates: List[str], role: str) -> str:
+        decision = ROUTING_CONTRACT.choose_slot(
+            key, role, len(candidates), legacy_key=conv_hash
+        )
+        metadata[f"{role}_slot"] = decision.slot
+        metadata[f"{role}_assignment_source"] = decision.source
+        return candidates[decision.slot]
+
+    has_prefill = bool(prefill_list)
+    has_decode = bool(all_decode)
+    has_replica = bool(replica_list)
     cache_affinity_hit = False
+
     if assigned:
-        if assigned.get("replica") and assigned["replica"] in replica_list:
-            # Continue with replica mode
+        if assigned.get("replica") in replica_list:
             routing_mode = "replica"
             replica_addr = assigned["replica"]
+            _record_affinity(metadata, "replica", replica_addr, replica_list)
+            cache_affinity_hit = True
+        elif assigned.get("decode") in all_decode:
+            decode_addr = assigned["decode"]
+            _record_affinity(metadata, "decode", decode_addr, all_decode)
+            if assigned.get("prefill") in prefill_list:
+                prefill_addr = assigned["prefill"]
+                _record_affinity(metadata, "prefill", prefill_addr, prefill_list)
+            elif prefill_list:
+                prefill_addr = choose(prefill_list, "prefill")
+            routing_mode = "ppd" if decode_addr in ppd_list else "pd"
             cache_affinity_hit = True
 
-        elif assigned.get("decode"):
-            # Continue with disagg mode
-            all_decode = decode_list + ppd_list
-            if assigned["decode"] in all_decode:
-                decode_addr = assigned["decode"]
-                if assigned.get("prefill") and assigned["prefill"] in prefill_list:
-                    prefill_addr = assigned["prefill"]
-                else:
-                    prefill_addr = prefill_list[hash(conv_hash) % len(prefill_list)] if prefill_list else None
-
-                if decode_addr in ppd_list:
-                    routing_mode = "ppd_direct" if current_turn > 1 else "ppd"
-                else:
-                    routing_mode = "pd"
-                cache_affinity_hit = True
-
-    # New conversation - determine routing mode (only if no cache affinity hit)
     if not cache_affinity_hit:
         if has_replica and not has_prefill and not has_decode:
-            # Pure replica mode (4R)
             routing_mode = "replica"
-            idx = hash(conv_hash) % len(replica_list)
-            replica_addr = replica_list[idx]
-
+            replica_addr = choose(replica_list, "replica")
         elif has_prefill and has_decode and not has_replica:
-            # Pure disaggregated mode (1P_3D, 2P_2pD, 1P_2D_1pD, etc.)
-            # Select prefill
-            idx = hash(conv_hash) % len(prefill_list)
-            prefill_addr = prefill_list[idx]
-
-            # Select decode - distribute across ALL decode servers (D + pD) by capacity
-            # This ensures mixed configs like 1P_2D_1pD use all 3 servers, not just pD
-            all_decode = decode_list + ppd_list
-            decode_idx = hash(conv_hash) % len(all_decode)
-            decode_addr = all_decode[decode_idx]
-
-            if decode_addr in ppd_list:
-                routing_mode = "ppd"
-            else:
-                routing_mode = "pd"
-
+            prefill_addr = choose(prefill_list, "prefill")
+            decode_addr = choose(all_decode, "decode")
+            routing_mode = "ppd" if decode_addr in ppd_list else "pd"
         elif has_prefill and has_decode and has_replica:
-            # Hybrid mode (1R_1P_2pD, 2R_1P_1D, etc.)
-            # Distribute requests between replica and disagg based on capacity
-            # Calculate total capacity slots
-            num_replica_slots = len(replica_list)
-            all_decode = decode_list + ppd_list
-            num_disagg_slots = len(all_decode)  # One slot per decode server
-            total_slots = num_replica_slots + num_disagg_slots
-
-            # Use hash to select slot
-            slot = hash(conv_hash) % total_slots
-
-            if slot < num_replica_slots:
-                # Route to replica
+            service_targets = [
+                *(('replica', address) for address in replica_list),
+                *(('decode', address) for address in all_decode),
+            ]
+            service = ROUTING_CONTRACT.choose_slot(
+                key, "service", len(service_targets), legacy_key=conv_hash
+            )
+            metadata["service_slot"] = service.slot
+            metadata["service_assignment_source"] = service.source
+            kind, address = service_targets[service.slot]
+            if kind == "replica":
                 routing_mode = "replica"
-                replica_addr = replica_list[slot]
+                replica_addr = address
+                _record_affinity(metadata, "replica", address, replica_list)
             else:
-                # Route to disagg
-                decode_idx = slot - num_replica_slots
-                if decode_idx < len(ppd_list):
-                    decode_addr = ppd_list[decode_idx]
-                    routing_mode = "ppd"
-                else:
-                    decode_addr = decode_list[decode_idx - len(ppd_list)]
-                    routing_mode = "pd"
-
-                # Select prefill
-                prefill_addr = prefill_list[hash(conv_hash) % len(prefill_list)]
-
+                decode_addr = address
+                _record_affinity(metadata, "decode", address, all_decode)
+                prefill_addr = choose(prefill_list, "prefill")
+                routing_mode = "ppd" if decode_addr in ppd_list else "pd"
         elif has_replica:
-            # Only replica available
             routing_mode = "replica"
-            idx = hash(conv_hash) % len(replica_list)
-            replica_addr = replica_list[idx]
+            replica_addr = choose(replica_list, "replica")
 
-    # For pD nodes: Turn 2+ always goes directly to pD (static x=1)
-    # pD nodes always use local prefix cache, no decision engine needed
     if routing_mode == "ppd" and current_turn > 1:
         routing_mode = "ppd_direct"
-
-    # For D nodes with dynamic PPD (--enable-ppd on D configs):
-    # Decision engine determines if Turn 2+ should bypass prefill
-    # and use local prefix cache instead of routing through P
     if routing_mode == "pd" and use_ppd_dynamic and current_turn > 1:
         routing_mode = "ppd_dynamic"
 
-    return prefill_addr, decode_addr, replica_addr, routing_mode
+    metadata["cache_affinity_hit"] = cache_affinity_hit
+    metadata["selected_prefill_addr"] = prefill_addr
+    metadata["selected_decode_addr"] = decode_addr
+    metadata["selected_replica_addr"] = replica_addr
+    result = (prefill_addr, decode_addr, replica_addr, routing_mode)
+    return (*result, metadata) if include_metadata else result
 
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+ENABLE_ORCA_HEADERS = os.environ.get("PPD_ENABLE_ORCA_HEADERS", "true").lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+def _parse_orca_header(value: Optional[str]) -> Dict[str, Any]:
+    if not value:
+        return {}
+    payload = value[5:] if value.startswith("JSON ") else value
+    try:
+        document = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    named = document.get("named_metrics") if isinstance(document, dict) else None
+    return dict(named) if isinstance(named, dict) else {}
 
 
 async def forward_request(
-    url: str, data: dict, request_id: str, response_meta: Optional[Dict[str, Any]] = None
+    url: str,
+    data: dict,
+    request_id: str,
+    response_meta: Optional[Dict[str, Any]] = None,
 ):
-    """Forward request to vLLM with streaming support."""
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}",
-            "X-Request-Id": request_id,
+    """Forward a request while recording HTTP/ORCA transport boundaries."""
+    meta = response_meta if response_meta is not None else {}
+    meta["http_start_ts"] = time.time()
+    try:
+        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+            headers = {
+                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}",
+                "X-Request-Id": request_id,
+            }
+            if ENABLE_ORCA_HEADERS:
+                headers["endpoint-load-metrics-format"] = "JSON"
+            async with session.post(url=url, json=data, headers=headers) as response:
+                meta["status"] = response.status
+                meta["http_headers_ts"] = time.time()
+                meta["orca"] = _parse_orca_header(
+                    response.headers.get("endpoint-load-metrics")
+                )
+                async for chunk_bytes in response.content.iter_any():
+                    if chunk_bytes:
+                        meta.setdefault("http_first_byte_ts", time.time())
+                        yield chunk_bytes
+    finally:
+        meta["http_end_ts"] = time.time()
+
+
+def _extract_upstream_json(
+    response_bytes: bytes, response_meta: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    try:
+        document = json.loads(response_bytes)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    request_metrics = document.get("ppd_request_metrics")
+    if isinstance(request_metrics, dict):
+        response_meta["request_metrics"] = request_metrics
+    return document
+
+
+def _phase_profile_fields(prefix: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    start = meta.get("http_start_ts")
+    headers = meta.get("http_headers_ts")
+    first = meta.get("http_first_byte_ts")
+    end = meta.get("http_end_ts")
+    orca = meta.get("orca") or {}
+    fields: Dict[str, Any] = {
+        f"{prefix}_status": meta.get("status"),
+        f"{prefix}_http_start_ts": round(start, 4) if start else None,
+        f"{prefix}_http_headers_ts": round(headers, 4) if headers else None,
+        f"{prefix}_http_first_byte_ts": round(first, 4) if first else None,
+        f"{prefix}_http_end_ts": round(end, 4) if end else None,
+        f"{prefix}_http_s": round(end - start, 4) if start and end else None,
+        f"{prefix}_http_headers_s": round(headers - start, 4) if start and headers else None,
+        f"{prefix}_http_first_byte_s": round(first - start, 4) if start and first else None,
+        f"{prefix}_orca_waiting_at_response": orca.get("num_requests_waiting"),
+        f"{prefix}_orca_kv_usage_at_response": orca.get("kv_cache_usage_perc"),
+        f"{prefix}_request_metrics": meta.get("request_metrics"),
+    }
+    request_metrics = meta.get("request_metrics") or {}
+    for name in (
+        "queue_s",
+        "prefill_elapsed_s",
+        "decode_elapsed_s",
+        "inference_elapsed_s",
+        "ttft_s",
+        "e2e_s",
+        "frontend_overhead_s",
+        "num_preemptions",
+        "prompt_tokens",
+        "cached_prompt_tokens",
+        "uncached_prompt_tokens",
+        "completion_tokens",
+        "requested_max_tokens",
+    ):
+        fields[f"{prefix}_engine_{name}"] = request_metrics.get(name)
+    return fields
+
+
+def _active_load_snapshot(
+    prefill_addr: Optional[str], generation_addr: Optional[str], conv_hash: str
+) -> Dict[str, Any]:
+    """Capture exact proxy in-flight counts immediately before this request."""
+    with active_request_lock:
+        conversations = active_decode_conversations.get(generation_addr or "", {})
+        generation_count = active_decode_requests.get(generation_addr or "", 0)
+        return {
+            "proxy_active_requests_before": sum(active_requests_by_phase.values()),
+            "proxy_active_prefill_requests_before": sum(active_prefill_requests.values()),
+            "proxy_active_decode_requests_before": sum(active_decode_requests.values()),
+            "proxy_active_requests_on_prefill_before": active_prefill_requests.get(
+                prefill_addr or "", 0
+            ),
+            "proxy_active_requests_on_generation_before": generation_count,
+            # Backward-compatible alias: the generation node is a D/pD in the
+            # configurations used by the Agent experiment.
+            "proxy_active_requests_on_decode_before": generation_count,
+            "proxy_other_inflight_conversations_on_decode": sum(
+                1 for key, count in conversations.items()
+                if key != conv_hash and count > 0
+            ),
         }
-        async with session.post(url=url, json=data, headers=headers) as response:
-            if response_meta is not None:
-                response_meta["status"] = response.status
-            # Always yield the response content, even for error status
-            async for chunk_bytes in response.content.iter_any():
-                if chunk_bytes:
-                    yield chunk_bytes
+
+
+def _active_request_change(
+    phase: str, address: Optional[str], conv_hash: str, delta: int
+) -> None:
+    address = address or "unknown"
+    with active_request_lock:
+        active_requests_by_phase[phase] += delta
+        if active_requests_by_phase[phase] <= 0:
+            active_requests_by_phase.pop(phase, None)
+        table = active_prefill_requests if phase == "prefill" else active_decode_requests
+        table[address] += delta
+        if table[address] <= 0:
+            table.pop(address, None)
+        if phase == "decode":
+            conversations = active_decode_conversations[address]
+            conversations[conv_hash] += delta
+            if conversations[conv_hash] <= 0:
+                conversations.pop(conv_hash, None)
+            if not conversations:
+                active_decode_conversations.pop(address, None)
 
 
 @app.route("/v1/completions", methods=["POST"])
 @app.route("/v1/chat/completions", methods=["POST"])
 async def handle_request():
-    """Handle inference requests with automatic routing."""
+    """Handle one physical HTTP attempt under the logical request contract."""
     t_enter = time.time()
+    t_route = t_enter
     t_prefill_done = None
     response_usage: Dict[str, Any] = {}
     feature_metadata: Dict[str, Any] = {}
-    decision_qps_est = 0.0
+    decision_metadata: Dict[str, Any] = {}
+    routing_metadata: Dict[str, Any] = {}
+    decision_rate: Dict[str, Any] = {}
+    observed_rate: Dict[str, Any] = {}
+    load_metadata: Dict[str, Any] = {}
     prefill_response_meta: Dict[str, Any] = {}
     decode_response_meta: Dict[str, Any] = {}
+    prefill_addr = decode_addr = replica_addr = generation_addr = None
+    routing_mode = None
+    turn_number = None
+    conv_hash = ""
+    request_id = ""
+    logical_retry = False
+    logical_physical_attempt = 1
+    ppd_decision = None
+    input_tokens = output_tokens = context_tokens = 0
+    decision_input_tokens = decision_output_tokens = decision_context_tokens = 0
+    routing_key = ""
+    routing_key_source = "unknown"
+    prefill_request_contract = None
     profile_context = {
-        "schema_version": 2,
+        "schema_version": 4,
         "run_id": request.headers.get("X-PPD-Run-ID", "unscoped"),
         "episode_id": request.headers.get("X-PPD-Episode-ID"),
         "conversation_id": request.headers.get("X-PPD-Conversation-ID"),
@@ -875,161 +1114,218 @@ async def handle_request():
         "request_attempt": request.headers.get("X-PPD-Request-Attempt", "1"),
     }
 
-    def _timing_record(t_first: Optional[float]) -> Dict[str, Any]:
+    def timing_record(t_first: Optional[float]) -> Dict[str, Any]:
+        now = time.time()
         record = {
             **profile_context,
             "ts_enter": round(t_enter, 4),
             "ts_route": round(t_route, 4),
             "ts_prefill_done": round(t_prefill_done, 4) if t_prefill_done else None,
             "ts_first_chunk": round(t_first, 4) if t_first else None,
-            "ts_exit": round(time.time(), 4),
+            "ts_exit": round(now, 4),
             "route": routing_mode,
             "turn": turn_number,
-            "conv": conv_hash[:8],
-            "request_id": request_id,
-            # Backward-compatible aliases used by existing analyzers.
-            "in_tokens": input_tokens,
-            "out_tokens": output_tokens,
-            "ctx_tokens": context_tokens,
-            # Explicit names distinguish decision-time estimates from the exact
-            # usage fields populated after vLLM tokenizes/generates the request.
-            "decision_input_tokens_est": input_tokens,
-            "decision_output_tokens_est": output_tokens,
-            "decision_context_tokens_est": context_tokens,
-            "decision_qps_est": decision_qps_est,
+            "conv": conv_hash[:8] if conv_hash else None,
+            "state_key_sha256": conv_hash or None,
+            "request_id": request_id or None,
+            "logical_retry": logical_retry,
+            "logical_physical_attempt": logical_physical_attempt,
+            "routing_key_source": routing_key_source,
+            "routing_key_label": routing_key if routing_key_source == "header" else None,
+            "in_tokens": decision_input_tokens,
+            "out_tokens": decision_output_tokens,
+            "ctx_tokens": decision_context_tokens,
+            "decision_input_tokens_est": decision_input_tokens,
+            "decision_output_tokens_est": decision_output_tokens,
+            "decision_context_tokens_est": decision_context_tokens,
+            "requested_output_tokens": decision_output_tokens,
+            "decision_qps_est": decision_rate.get("decision_qps_est"),
+            "decision_qps_source": decision_rate.get("decision_qps_source"),
+            "decision_rate_snapshot": decision_rate,
+            "arrival_rate_snapshot": observed_rate,
             "ppd_mode_enabled": ENABLE_PPD_MODE,
             "ppd_decision": ppd_decision,
+            "decision_source": decision_metadata.get("decision_source"),
+            "selected_calibration_cell": decision_metadata.get(
+                "selected_calibration_cell"
+            ),
+            "decision_metadata": decision_metadata,
             **feature_metadata,
+            **routing_metadata,
+            **load_metadata,
             "prefill_addr": prefill_addr,
             "decode_addr": decode_addr,
+            "replica_addr": replica_addr,
+            "generation_addr": generation_addr,
+            "prefill_request_contract": prefill_request_contract,
             "t_route_s": round(t_route - t_enter, 4),
             "t_prefill_s": round(t_prefill_done - t_route, 4) if t_prefill_done else None,
-            # First transport chunk is not necessarily the first generated token.
+            # Transport first-byte/chunk, explicitly not model first-token time.
             "ttfc_s": round(t_first - t_enter, 4) if t_first else None,
-            "prefill_status": prefill_response_meta.get("status"),
-            "decode_status": decode_response_meta.get("status"),
-            "t_total_s": round(time.time() - t_enter, 4),
+            "t_total_s": round(now - t_enter, 4),
         }
+        record.update(_phase_profile_fields("prefill", prefill_response_meta))
+        record.update(_phase_profile_fields("decode", decode_response_meta))
         record.update(response_usage)
         return record
 
     try:
         data = await request.get_json()
+        routing_key, routing_key_source = get_routing_identity(
+            data,
+            explicit_routing_key=request.headers.get("X-PPD-Routing-Key"),
+        )
         conv_hash = get_conversation_hash(
             data,
             conversation_id=profile_context["conversation_id"],
             run_id=profile_context["run_id"],
         )
-
-        # Get conversation state
-        current_turn, assigned = get_conversation_info(conv_hash)
-
-        # Dynamic PPD decision
-        use_ppd_dynamic = False
-        ppd_decision = None
+        logical_record = get_logical_request(
+            conv_hash, profile_context["client_request_id"]
+        )
+        logical_retry = logical_record is not None
+        observed_rate = record_request_arrival(t_enter, is_logical=not logical_retry)
         input_tokens, output_tokens, context_tokens, feature_metadata = (
             _extract_request_features_with_metadata(data)
         )
 
-        with stats_lock:
-            decision_qps_est = stats.get("total_requests", 0) / max(
-                1, time.time() - stats.get("start_time", time.time())
+        if logical_record is not None:
+            turn_number = int(logical_record["turn"])
+            prefill_addr = logical_record.get("prefill_addr")
+            decode_addr = logical_record.get("decode_addr")
+            replica_addr = logical_record.get("replica_addr")
+            routing_mode = logical_record.get("routing_mode")
+            ppd_decision = logical_record.get("ppd_decision")
+            decision_metadata = dict(logical_record.get("decision_metadata") or {})
+            routing_metadata = dict(logical_record.get("routing_metadata") or {})
+            decision_rate = dict(logical_record.get("decision_rate") or {})
+            decision_input_tokens = int(logical_record.get("decision_input_tokens", input_tokens))
+            decision_output_tokens = int(logical_record.get("decision_output_tokens", output_tokens))
+            decision_context_tokens = int(logical_record.get("decision_context_tokens", context_tokens))
+            logical_physical_attempt = int(logical_record.get("physical_attempts", 2))
+        else:
+            current_turn, assigned = get_conversation_info(conv_hash)
+            candidate_turn = current_turn + 1
+            decision_rate = dict(observed_rate)
+            decision_input_tokens = input_tokens
+            decision_output_tokens = output_tokens
+            decision_context_tokens = context_tokens
+            use_ppd_dynamic = False
+            if ENABLE_PPD_MODE and PPD_DECISION_ENGINE is not None:
+                ppd_decision, decision_metadata = (
+                    PPD_DECISION_ENGINE.decide_with_metadata(
+                        turn=candidate_turn,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        current_qps=float(decision_rate["decision_qps_est"]),
+                        context_tokens=context_tokens,
+                    )
+                )
+                use_ppd_dynamic = bool(ppd_decision)
+            prefill_addr, decode_addr, replica_addr, routing_mode, routing_metadata = (
+                select_servers(
+                    conv_hash,
+                    candidate_turn,
+                    assigned,
+                    use_ppd_dynamic=use_ppd_dynamic,
+                    routing_key=routing_key,
+                    include_metadata=True,
+                )
+            )
+            routing_metadata["routing_key_source"] = routing_key_source
+            new_assigned = {
+                role: address
+                for role, address in (
+                    ("prefill", prefill_addr),
+                    ("decode", decode_addr),
+                    ("replica", replica_addr),
+                )
+                if address
+            }
+            turn_number, final_assigned = update_conversation(conv_hash, new_assigned)
+            save_logical_request(
+                conv_hash,
+                profile_context["client_request_id"],
+                {
+                    "turn": turn_number,
+                    "assigned": final_assigned,
+                    "prefill_addr": prefill_addr,
+                    "decode_addr": decode_addr,
+                    "replica_addr": replica_addr,
+                    "routing_mode": routing_mode,
+                    "ppd_decision": ppd_decision,
+                    "decision_metadata": decision_metadata,
+                    "routing_metadata": routing_metadata,
+                    "decision_rate": decision_rate,
+                    "decision_input_tokens": decision_input_tokens,
+                    "decision_output_tokens": decision_output_tokens,
+                    "decision_context_tokens": decision_context_tokens,
+                },
             )
 
-        if ENABLE_PPD_MODE and PPD_DECISION_ENGINE is not None:
-            # Call decision engine (returns False for Turn 1).
-            ppd_decision = PPD_DECISION_ENGINE.should_use_ppd(
-                turn=current_turn + 1,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                current_qps=decision_qps_est,
-                context_tokens=context_tokens,
-            )
-            use_ppd_dynamic = ppd_decision
-
-        # Select servers
-        prefill_addr, decode_addr, replica_addr, routing_mode = select_servers(
-            conv_hash, current_turn + 1, assigned, use_ppd_dynamic=use_ppd_dynamic
-        )
-        t_route = time.time()
-
-        # Update conversation state
-        new_assigned = {}
-        if prefill_addr:
-            new_assigned["prefill"] = prefill_addr
-        if decode_addr:
-            new_assigned["decode"] = decode_addr
-        if replica_addr:
-            new_assigned["replica"] = replica_addr
-
-        turn_number, final_assigned = update_conversation(conv_hash, new_assigned)
-
-        # Update statistics
-        with stats_lock:
-            stats["total_requests"] += 1
-            if turn_number == 1:
-                stats["turn1_requests"] += 1
-            else:
-                stats["turn2plus_requests"] += 1
-                if assigned:
-                    stats["cache_affinity_hits"] += 1
+            with stats_lock:
+                if turn_number == 1:
+                    stats["turn1_requests"] += 1
                 else:
-                    stats["cache_affinity_misses"] += 1
+                    stats["turn2plus_requests"] += 1
+                    if assigned:
+                        stats["cache_affinity_hits"] += 1
+                    else:
+                        stats["cache_affinity_misses"] += 1
+                counter = {
+                    "pd": "pd_requests",
+                    "ppd": "ppd_requests",
+                    "ppd_direct": "ppd_direct_requests",
+                    "ppd_dynamic": "ppd_dynamic_requests",
+                    "replica": "replica_requests",
+                }.get(routing_mode)
+                if counter:
+                    stats[counter] += 1
 
-            if routing_mode == "pd":
-                stats["pd_requests"] += 1
-            elif routing_mode == "ppd":
-                stats["ppd_requests"] += 1
-            elif routing_mode == "ppd_direct":
-                stats["ppd_direct_requests"] += 1
-            elif routing_mode == "ppd_dynamic":
-                stats["ppd_dynamic_requests"] += 1
-            elif routing_mode == "replica":
-                stats["replica_requests"] += 1
+            if ENABLE_PPD_MODE and ppd_decision is not None:
+                log_ppd_decision(
+                    conv_hash=conv_hash,
+                    turn=turn_number,
+                    input_tokens=decision_input_tokens,
+                    output_tokens=decision_output_tokens,
+                    context_tokens=decision_context_tokens,
+                    current_qps=float(decision_rate["decision_qps_est"]),
+                    decision=bool(ppd_decision),
+                    routing_mode=routing_mode,
+                    decision_metadata=decision_metadata,
+                )
 
-        # Log PPD decision for analysis
-        if ENABLE_PPD_MODE and ppd_decision is not None:
-            log_ppd_decision(
-                conv_hash=conv_hash,
-                turn=turn_number,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                context_tokens=context_tokens,
-                current_qps=decision_qps_est,
-                decision=ppd_decision,
-                routing_mode=routing_mode,
-            )
+        t_route = time.time()
+        if not routing_mode or (not decode_addr and not replica_addr):
+            raise RuntimeError("routing contract found no generation server")
+        generation_addr = decode_addr or replica_addr
+        load_metadata = _active_load_snapshot(prefill_addr, generation_addr, conv_hash)
+        is_streaming = bool(data.get("stream", False))
 
-        is_streaming = data.get("stream", False)
-
-        # Route based on mode
         if routing_mode == "replica":
-            # Direct to replica
             request_id = f"replica_{uuid.uuid4().hex}"
             target_url = f"http://{replica_addr}{request.path}"
-
-            print(f"[PROXY] Replica: turn={turn_number}, conv={conv_hash[:8]}, "
-                  f"-> R:{replica_addr}")
-
+            print(
+                f"[PROXY] Replica: turn={turn_number}, retry={logical_retry}, "
+                f"conv={conv_hash[:8]} -> R:{replica_addr}"
+            )
         elif routing_mode == "ppd_direct":
-            # Direct to pD (no prefill needed)
             request_id = f"ppd_direct_{uuid.uuid4().hex}"
             target_url = f"http://{decode_addr}{request.path}"
-
-            print(f"[PROXY] PPD-Direct: turn={turn_number}, conv={conv_hash[:8]}, "
-                  f"-> pD:{decode_addr}")
-
+            print(
+                f"[PROXY] PPD-Direct: turn={turn_number}, retry={logical_retry}, "
+                f"conv={conv_hash[:8]} -> pD:{decode_addr}"
+            )
         elif routing_mode == "ppd_dynamic":
-            # Dynamic PPD mode - direct to D (treating it like pD for Turn 2+)
             request_id = f"ppd_dynamic_{uuid.uuid4().hex}"
             target_url = f"http://{decode_addr}{request.path}"
-
-            print(f"[PROXY] PPD-Dynamic: turn={turn_number}, conv={conv_hash[:8]}, "
-                  f"in={input_tokens}, out={output_tokens}, ctx={context_tokens}, "
-                  f"-> D:{decode_addr}")
-
+            print(
+                f"[PROXY] PPD-Dynamic: turn={turn_number}, retry={logical_retry}, "
+                f"conv={conv_hash[:8]}, in={decision_input_tokens}, "
+                f"out={decision_output_tokens}, ctx={decision_context_tokens} "
+                f"-> D:{decode_addr}"
+            )
         else:
-            # PD or PPD mode - need prefill first
             with prefill_cv:
                 prefill_zmq = prefill_instances.get(prefill_addr, ("", 0))[0]
             with decode_cv:
@@ -1037,106 +1333,125 @@ async def handle_request():
             if not decode_zmq:
                 with ppd_decode_cv:
                     decode_zmq = ppd_decode_instances.get(decode_addr, ("", 0))[0]
-
             request_id = (
                 f"___prefill_addr_{prefill_zmq}___decode_addr_"
                 f"{decode_zmq}_{uuid.uuid4().hex}"
             )
-
-            # Prefill request
             prefill_request = data.copy()
             prefill_request["max_tokens"] = 1
             if "max_completion_tokens" in prefill_request:
                 prefill_request["max_completion_tokens"] = 1
-
-            print(f"[PROXY] {routing_mode.upper()}: turn={turn_number}, "
-                  f"conv={conv_hash[:8]}, P:{prefill_addr} -> D:{decode_addr}")
-
-            # Execute prefill
-            async for _ in forward_request(
-                f"http://{prefill_addr}{request.path}",
-                prefill_request,
-                request_id,
-                prefill_response_meta,
-            ):
-                continue
-            t_prefill_done = time.time()  # P-node prefill complete (KV transfer async)
-
+            # The prompt/tool schemas remain identical because vLLM excludes
+            # tools for tool_choice=none only when a separate opt-in flag is
+            # enabled. This changes only output parsing and avoids strict JSON
+            # validation of a deliberately one-token prefill-only generation.
+            if prefill_request.get("tools"):
+                prefill_request["tool_choice"] = "none"
+            prefill_request["stream"] = False
+            prefill_request.pop("stream_options", None)
+            prefill_request_contract = "same_prompt_tool_choice_none_max_tokens_1_v1"
+            print(
+                f"[PROXY] {routing_mode.upper()}: turn={turn_number}, "
+                f"retry={logical_retry}, conv={conv_hash[:8]}, "
+                f"P:{prefill_addr} -> D:{decode_addr}"
+            )
+            prefill_bytes = b""
+            _active_request_change("prefill", prefill_addr, conv_hash, 1)
+            try:
+                async for chunk in forward_request(
+                    f"http://{prefill_addr}{request.path}",
+                    prefill_request,
+                    request_id,
+                    prefill_response_meta,
+                ):
+                    prefill_bytes += chunk
+            finally:
+                _active_request_change("prefill", prefill_addr, conv_hash, -1)
+            _extract_upstream_json(prefill_bytes, prefill_response_meta)
+            t_prefill_done = time.time()
             target_url = f"http://{decode_addr}{request.path}"
 
-        # Execute decode/generation
         if is_streaming:
-            async def _timed_stream():
-                # PPD profiling: record first transport chunk (TTFC) and total.
+            async def timed_stream():
                 t_first = None
-                async for chunk in forward_request(
-                    target_url, data, request_id, decode_response_meta
-                ):
-                    if t_first is None:
-                        t_first = time.time()
-                    yield chunk
-                _write_timing(_timing_record(t_first))
+                _active_request_change("decode", generation_addr, conv_hash, 1)
+                try:
+                    async for chunk in forward_request(
+                        target_url, data, request_id, decode_response_meta
+                    ):
+                        if t_first is None:
+                            t_first = time.time()
+                        yield chunk
+                finally:
+                    _active_request_change("decode", generation_addr, conv_hash, -1)
+                    _write_timing(timing_record(t_first))
 
             return Response(
-                _timed_stream(),
+                timed_stream(),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "Transfer-Encoding": "chunked",
-                }
+                },
             )
-        else:
-            response_bytes = b""
+
+        response_bytes = b""
+        _active_request_change("decode", generation_addr, conv_hash, 1)
+        try:
             async for chunk in forward_request(
                 target_url, data, request_id, decode_response_meta
             ):
                 response_bytes += chunk
-            try:
-                response_json = json.loads(response_bytes)
-                usage = response_json.get("usage") or {}
-                details = usage.get("prompt_tokens_details") or {}
-                response_usage.update({
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "total_tokens": usage.get("total_tokens"),
-                    "cached_tokens": details.get("cached_tokens"),
-                })
-                if response_json.get("error"):
-                    response_usage["upstream_error"] = str(response_json["error"])[:1000]
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                pass
-            _write_timing(_timing_record(None))
-            return response_bytes, decode_response_meta.get("status", 502), {
-                "Content-Type": "application/json"
-            }
+        finally:
+            _active_request_change("decode", generation_addr, conv_hash, -1)
+        response_json = _extract_upstream_json(response_bytes, decode_response_meta)
+        if response_json is not None:
+            usage = response_json.get("usage") or {}
+            details = usage.get("prompt_tokens_details") or {}
+            prompt_tokens = usage.get("prompt_tokens")
+            cached_tokens = details.get("cached_tokens")
+            response_usage.update({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": usage.get("completion_tokens"),
+                "actual_output_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "cached_tokens": cached_tokens,
+                "uncached_prompt_tokens": (
+                    max(0, prompt_tokens - cached_tokens)
+                    if isinstance(prompt_tokens, int) and isinstance(cached_tokens, int)
+                    else None
+                ),
+            })
+            if response_json.get("error"):
+                response_usage["upstream_error"] = str(response_json["error"])[:1000]
+        _write_timing(timing_record(None))
+        return response_bytes, decode_response_meta.get("status", 502), {
+            "Content-Type": "application/json"
+        }
 
-    except Exception as e:
+    except Exception as exc:
         import traceback
-        print(f"[PROXY] Error: {e}")
+        print(f"[PROXY] Error: {exc}")
         traceback.print_exc()
-        _write_timing({
-            **profile_context,
-            "ts_enter": round(t_enter, 4),
-            "ts_exit": round(time.time(), 4),
-            "route": None,
-            "error": f"{type(e).__name__}: {e}",
-        })
-        return {"error": str(e)}, 500
+        error_record = timing_record(None)
+        error_record["error"] = f"{type(exc).__name__}: {exc}"
+        _write_timing(error_record)
+        return {"error": str(exc)}, 500
 
 
 @app.route("/status", methods=["GET"])
 async def get_status():
     """Get proxy status."""
     with prefill_cv:
-        p_list = list(prefill_instances.keys())
+        p_list = ROUTING_CONTRACT.candidate_addresses(prefill_instances.keys())
     with decode_cv:
-        d_list = list(decode_instances.keys())
+        d_list = ROUTING_CONTRACT.candidate_addresses(decode_instances.keys())
     with ppd_decode_cv:
-        pd_list = list(ppd_decode_instances.keys())
+        pd_list = ROUTING_CONTRACT.candidate_addresses(ppd_decode_instances.keys())
     with replica_cv:
-        r_list = list(replica_instances.keys())
+        r_list = ROUTING_CONTRACT.candidate_addresses(replica_instances.keys())
 
     with stats_lock:
         current_stats = stats.copy()
@@ -1150,6 +1465,9 @@ async def get_status():
             "replica": r_list,
         },
         "conversations": len(conversation_state),
+        "logical_request_records": len(logical_request_state),
+        "routing_contract": ROUTING_CONTRACT.descriptor(),
+        "orca_response_load_enabled": ENABLE_ORCA_HEADERS,
         "stats": current_stats,
     }
 
@@ -1239,7 +1557,7 @@ async def get_ppd_performance():
 
 
 def main():
-    global CONFIG_NAME, ENABLE_PPD_MODE, PPD_DECISION_ENGINE
+    global CONFIG_NAME, ENABLE_PPD_MODE, PPD_DECISION_ENGINE, ROUTING_CONTRACT
 
     parser = argparse.ArgumentParser(description="Comprehensive Proxy Server")
     parser.add_argument("--config", type=str, default="2P_2D",
@@ -1250,6 +1568,29 @@ def main():
                         help="ZMQ port for service discovery")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Host to bind to")
+    parser.add_argument(
+        "--routing-mode",
+        choices=ROUTING_MODES,
+        default=os.environ.get("PPD_ROUTING_MODE", "stable_hash"),
+        help="Stable SHA-256 assignment (default) or pre-fix Python hash behavior.",
+    )
+    parser.add_argument(
+        "--routing-seed",
+        default=os.environ.get("PPD_ROUTING_SEED", "agentic-ppd-v1"),
+        help="Explicit seed shared by paired experiment configurations.",
+    )
+    parser.add_argument(
+        "--routing-map-path",
+        default=os.environ.get("PPD_ROUTING_MAP_PATH") or None,
+        help="Optional frozen sample-to-slot JSON map.",
+    )
+    parser.add_argument(
+        "--routing-map-strict",
+        action="store_true",
+        default=os.environ.get("PPD_ROUTING_MAP_STRICT", "false").lower()
+        in {"1", "true", "yes", "on"},
+        help="Fail closed when the frozen map lacks a requested key/role.",
+    )
 
     # Dynamic PPD mode arguments
     parser.add_argument("--enable-ppd-mode", action="store_true",
@@ -1271,6 +1612,12 @@ def main():
 
     args = parser.parse_args()
     CONFIG_NAME = args.config
+    ROUTING_CONTRACT = RoutingContract(
+        mode=args.routing_mode,
+        seed=args.routing_seed,
+        map_path=args.routing_map_path,
+        map_strict=args.routing_map_strict,
+    )
 
     # Get decode port configuration
     decode_config = DECODE_PORTS_BY_CONFIG.get(CONFIG_NAME, {"D": [], "pD": []})
@@ -1282,6 +1629,7 @@ def main():
     print(f"[PROXY] Decode ports: D={d_ports}, pD={ppd_ports}")
     print(f"[PROXY] HTTP: {args.host}:{args.http_port}")
     print(f"[PROXY] ZMQ: {args.host}:{args.zmq_port}")
+    print(f"[PROXY] Routing contract: {json.dumps(ROUTING_CONTRACT.descriptor())}")
 
     configure_feature_tokenizer(args.feature_tokenizer_path)
 

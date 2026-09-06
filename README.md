@@ -88,6 +88,10 @@ results/                          # Benchmark results
     comprehensive/                # Decision engine lookup data
 ```
 
+The deterministic matched-run routing, logical retry, prefill-only and
+request-profile semantics used by live-Agent experiments are specified in
+[`docs/agent_serving_contract.md`](docs/agent_serving_contract.md).
+
 **vLLM patch:** Modifications in `vllm-source/vllm/distributed/kv_transfer/kv_connector/v1/p2p/p2p_nccl_connector.py`:
 - **D-direct mode detection:** When a request arrives at a pD node without PD-format request ID, it skips external KV loading and uses the local prefix cache instead.
 - **Network latency simulation:** Injects calibrated delay after KV transfer to emulate multi-node bandwidth (controlled by `SIMULATED_KV_BW_GBps`). Methodology follows TetriInfer (Hu et al., 2024).

@@ -78,6 +78,16 @@ fi
 echo "[1/5] Starting Proxy..."
 PROXY_PORT=10001
 PROXY_CONTROL_PORT=30001
+ROUTING_ARGS=(
+    --routing-mode "$PPD_ROUTING_MODE"
+    --routing-seed "$PPD_ROUTING_SEED"
+)
+if [ -n "$PPD_ROUTING_MAP_PATH" ]; then
+    ROUTING_ARGS+=(--routing-map-path "$PPD_ROUTING_MAP_PATH")
+fi
+if [ "$PPD_ROUTING_MAP_STRICT" = "true" ]; then
+    ROUTING_ARGS+=(--routing-map-strict)
+fi
 
 # Build PPD arguments from environment variables
 PPD_ARGS=""
@@ -93,6 +103,7 @@ python "$SRC_DIR/comprehensive_proxy.py" \
     --config 2P_2D \
     --http-port $PROXY_PORT \
     --zmq-port $PROXY_CONTROL_PORT \
+    "${ROUTING_ARGS[@]}" \
     $PPD_ARGS \
     > "$LOG_DIR/proxy.log" 2>&1 &
 sleep 2

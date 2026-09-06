@@ -208,6 +208,9 @@ class RequestStateStats:
     # first token latency
     first_token_latency: float = 0.0
 
+    # Count scheduler preemptions for this individual request.
+    num_preemptions: int = 0
+
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
@@ -326,6 +329,7 @@ class IterationStats:
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                req_stats.num_preemptions += 1
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(

@@ -44,7 +44,16 @@ export UNI_AGENT_LOG_DIR="${UNI_AGENT_LOG_DIR:-$RUN_DIR/rollouts}"
     printf 'command='
     printf '%q ' "$@"
     printf '\n'
+    printf 'routing_mode=%s\n' "${PPD_ROUTING_MODE:-proxy-default}"
+    printf 'routing_seed=%s\n' "${PPD_ROUTING_SEED:-proxy-default}"
+    printf 'routing_map_path=%s\n' "${PPD_ROUTING_MAP_PATH:-none}"
+    printf 'routing_map_strict=%s\n' "${PPD_ROUTING_MAP_STRICT:-false}"
+    printf 'vllm_ppd_commit=%s\n' "$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    printf 'uni_agent_commit=%s\n' "$(git -C /root/uni-agent rev-parse HEAD 2>/dev/null || echo unknown)"
 } > "$RUN_DIR/manifest.txt"
+
+curl --noproxy '*' -fsS http://127.0.0.1:10001/status \
+    > "$RUN_DIR/proxy_status_start.json" 2> "$RUN_DIR/proxy_status_start.error" || true
 
 python "$PROJECT_DIR/scripts/profile_metrics_poller.py" \
     --run-id "$RUN_ID" \
@@ -61,6 +70,8 @@ set -e
 kill -TERM "$METRICS_PID" 2>/dev/null || true
 wait "$METRICS_PID" 2>/dev/null || true
 printf 'end_ts=%s\nworkload_status=%s\n' "$(date +%s.%N)" "$WORKLOAD_STATUS" >> "$RUN_DIR/manifest.txt"
+curl --noproxy '*' -fsS http://127.0.0.1:10001/status \
+    > "$RUN_DIR/proxy_status_end.json" 2> "$RUN_DIR/proxy_status_end.error" || true
 
 python "$PROJECT_DIR/scripts/profile_analyze_v2.py" --run-dir "$RUN_DIR" \
     2>&1 | tee "$RUN_DIR/analysis.txt"

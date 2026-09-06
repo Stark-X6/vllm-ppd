@@ -89,6 +89,299 @@ def proxy_overlaps(rows: list[dict[str, Any]], start: float, end: float) -> list
     ]
 
 
+def _port_from_addr(address: Any) -> str | None:
+    value = str(address or "")
+    return value.rsplit(":", 1)[-1] if ":" in value else None
+
+
+def _healthy_node_metrics(
+    metrics: list[dict[str, Any]], port: str | None
+) -> list[dict[str, Any]]:
+    if not port:
+        return []
+
+    def matches_port(row: dict[str, Any]) -> bool:
+        try:
+            return str(int(float(row.get("port")))) == port
+        except (TypeError, ValueError):
+            return False
+
+    return sorted(
+        [
+            row for row in metrics
+            if row.get("status") != "error" and matches_port(row)
+        ],
+        key=lambda row: float(row["ts"]),
+    )
+
+
+def _nearest_metric(
+    rows: list[dict[str, Any]], timestamp: float, tolerance_s: float = 2.0
+) -> tuple[dict[str, Any] | None, float | None]:
+    if not rows:
+        return None, None
+    row = min(rows, key=lambda item: abs(float(item["ts"]) - timestamp))
+    delta = float(row["ts"]) - timestamp
+    return (row, delta) if abs(delta) <= tolerance_s else (None, delta)
+
+
+def build_request_profiles(
+    proxy: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Join every physical request to both server phases and live episodes."""
+    episode_windows = []
+    episode_node: dict[str, str] = {}
+    previous_step: dict[tuple[str, str], dict[str, Any]] = {}
+    for trace in traces:
+        episode = trace.get("episode_id")
+        start = float(trace.get("episode_start") or 0)
+        end = float(
+            trace.get("episode_end")
+            or start + float(trace.get("episode_duration_s") or 0)
+        )
+        if episode and start and end:
+            episode_windows.append((str(episode), start, end))
+        if episode:
+            ordered = sorted(
+                trace.get("steps_detail") or [],
+                key=lambda step: int(step.get("step", 0)),
+            )
+            for prior, current in zip(ordered, ordered[1:]):
+                previous_step[(str(episode), str(current.get("step")))] = prior
+    for row in proxy:
+        episode = row.get("episode_id")
+        node = row.get("generation_addr") or row.get("decode_addr") or row.get("replica_addr")
+        if episode and node and str(episode) not in episode_node:
+            episode_node[str(episode)] = str(node)
+
+    profiles = []
+    for row in proxy:
+        profile = dict(row)
+        profile["request_profile_schema_version"] = 1
+        start = float(row.get("ts_enter") or 0)
+        end = float(row.get("ts_exit") or start)
+
+        def attach_node_window(prefix: str, address: Any) -> None:
+            node_metrics = _healthy_node_metrics(metrics, _port_from_addr(address))
+            entry, entry_delta = _nearest_metric(node_metrics, start)
+            exit_row, exit_delta = _nearest_metric(node_metrics, end)
+            during = window_rows(node_metrics, start, end)
+            profile[f"{prefix}_metrics_entry_delta_s"] = entry_delta
+            profile[f"{prefix}_metrics_exit_delta_s"] = exit_delta
+            for suffix, sample in (("enter", entry), ("exit", exit_row)):
+                for source, target in (
+                    ("running", "running"),
+                    ("waiting", "waiting"),
+                    ("cache_usage_pct", "kv_usage"),
+                    ("gpu_util_pct", "gpu_util_pct"),
+                ):
+                    profile[f"{prefix}_load_{suffix}_{target}"] = (
+                        sample.get(source) if sample else None
+                    )
+            for source, target in (
+                ("running", "running"),
+                ("waiting", "waiting"),
+                ("cache_usage_pct", "kv_usage"),
+                ("gpu_util_pct", "gpu_util_pct"),
+            ):
+                values = metric_values(during, source)
+                profile[f"{prefix}_load_max_{target}"] = max(values) if values else None
+                profile[f"{prefix}_load_mean_{target}"] = (
+                    statistics.mean(values) if values else None
+                )
+            preemptions = metric_values(during, "preemptions")
+            profile[f"{prefix}_node_preemptions_delta_during"] = (
+                max(preemptions) - min(preemptions)
+                if len(preemptions) >= 2 else None
+            )
+
+        generation_addr = (
+            row.get("generation_addr") or row.get("decode_addr") or row.get("replica_addr")
+        )
+        attach_node_window("prefill", row.get("prefill_addr"))
+        attach_node_window("decode", generation_addr)
+
+        # Compatibility aliases retain the previous decode/generation-node
+        # column names while the prefixed fields make the two nodes explicit.
+        profile["metrics_entry_delta_s"] = profile.get("decode_metrics_entry_delta_s")
+        profile["metrics_exit_delta_s"] = profile.get("decode_metrics_exit_delta_s")
+        for aggregate in ("enter", "exit", "max", "mean"):
+            for metric in ("running", "waiting", "kv_usage", "gpu_util_pct"):
+                profile[f"load_{aggregate}_{metric}"] = profile.get(
+                    f"decode_load_{aggregate}_{metric}"
+                )
+        profile["node_preemptions_delta_during"] = profile.get(
+            "decode_node_preemptions_delta_during"
+        )
+
+        episode = str(row.get("episode_id") or "")
+        live = [
+            candidate for candidate, ep_start, ep_end in episode_windows
+            if ep_start <= start <= ep_end
+        ]
+        other_live = [candidate for candidate in live if candidate != episode]
+        same_node = [
+            candidate for candidate in other_live
+            if episode_node.get(candidate) == str(generation_addr or "")
+        ]
+        profile["active_episodes_total"] = len(live)
+        profile["other_active_episodes_total"] = len(other_live)
+        profile["same_node_other_active_episodes"] = len(same_node)
+        profile["same_node_other_active_episode_ids"] = same_node
+
+        engine = row.get("decode_request_metrics") or {}
+        prompt = row.get("prompt_tokens")
+        cached = row.get("cached_tokens")
+        if cached is None:
+            cached = engine.get("cached_prompt_tokens")
+        uncached = engine.get("uncached_prompt_tokens")
+        if uncached is None:
+            uncached = (
+                max(0, prompt - cached)
+                if isinstance(prompt, (int, float)) and isinstance(cached, (int, float))
+                else None
+            )
+        profile["uncached_prompt_tokens_observed"] = uncached
+
+        prior = previous_step.get((episode, str(row.get("step_id"))))
+        reusable = reusable_prefix_tokens(prior) if prior else None
+        if (
+            not row.get("logical_retry")
+            and isinstance(reusable, (int, float))
+            and reusable > 0
+            and isinstance(cached, (int, float))
+        ):
+            profile["previous_reusable_tokens"] = reusable
+            profile["lost_reusable_tokens"] = max(0, reusable - cached)
+            profile["cache_retention"] = cached / reusable
+        else:
+            profile["previous_reusable_tokens"] = None
+            profile["lost_reusable_tokens"] = None
+            profile["cache_retention"] = None
+        profiles.append(profile)
+    return profiles
+
+
+REQUEST_PROFILE_CSV_FIELDS = [
+    "request_profile_schema_version", "run_id", "episode_id", "conversation_id",
+    "step_id", "client_request_id", "request_phase", "request_attempt",
+    "logical_retry", "logical_physical_attempt", "turn", "route",
+    "routing_contract_version", "routing_mode_config", "routing_seed",
+    "routing_map_fingerprint_sha256", "routing_key_source", "routing_key_label",
+    "routing_key_sha256", "decode_slot", "decode_assignment_source",
+    "prefill_slot", "prefill_assignment_source", "prefill_addr", "decode_addr",
+    "replica_addr", "generation_addr", "ts_enter", "ts_exit", "t_total_s",
+    "prefill_http_s", "decode_http_s", "prefill_engine_queue_s",
+    "prefill_engine_prefill_elapsed_s", "prefill_engine_decode_elapsed_s",
+    "prefill_engine_ttft_s", "prefill_engine_num_preemptions",
+    "decode_engine_queue_s", "decode_engine_prefill_elapsed_s",
+    "decode_engine_decode_elapsed_s",
+    "decode_engine_inference_elapsed_s", "decode_engine_ttft_s", "decode_engine_e2e_s",
+    "decode_engine_frontend_overhead_s", "decode_engine_num_preemptions",
+    "prompt_tokens", "cached_tokens", "uncached_prompt_tokens",
+    "uncached_prompt_tokens_observed", "previous_reusable_tokens",
+    "lost_reusable_tokens", "cache_retention", "completion_tokens",
+    "requested_output_tokens",
+    "actual_output_tokens", "decision_input_tokens_est", "decision_context_tokens_est",
+    "decision_output_tokens_est", "decision_qps_est", "decision_qps_source",
+    "decision_source", "selected_calibration_cell", "ppd_decision",
+    "proxy_active_requests_on_prefill_before",
+    "proxy_active_requests_on_generation_before", "proxy_active_requests_on_decode_before",
+    "proxy_other_inflight_conversations_on_decode", "active_episodes_total",
+    "other_active_episodes_total", "same_node_other_active_episodes",
+    "same_node_other_active_episode_ids",
+    "prefill_load_enter_running", "prefill_load_enter_waiting", "prefill_load_enter_kv_usage",
+    "prefill_load_max_running", "prefill_load_max_waiting", "prefill_load_max_kv_usage",
+    "prefill_load_exit_running", "prefill_load_exit_waiting", "prefill_load_exit_kv_usage",
+    "prefill_node_preemptions_delta_during", "prefill_metrics_entry_delta_s",
+    "prefill_metrics_exit_delta_s", "decode_load_enter_running", "decode_load_enter_waiting",
+    "decode_load_enter_kv_usage", "decode_load_max_running", "decode_load_max_waiting",
+    "decode_load_max_kv_usage", "decode_load_exit_running", "decode_load_exit_waiting",
+    "decode_load_exit_kv_usage", "decode_node_preemptions_delta_during",
+    "decode_metrics_entry_delta_s", "decode_metrics_exit_delta_s",
+    "load_enter_running", "load_enter_waiting", "load_enter_kv_usage",
+    "load_max_running", "load_max_waiting", "load_max_kv_usage",
+    "load_exit_running", "load_exit_waiting", "load_exit_kv_usage",
+    "node_preemptions_delta_during", "prefill_orca_waiting_at_response",
+    "prefill_orca_kv_usage_at_response", "decode_orca_waiting_at_response",
+    "decode_orca_kv_usage_at_response", "metrics_entry_delta_s", "metrics_exit_delta_s",
+]
+
+
+def write_request_profiles(profiles: list[dict[str, Any]], run_dir: Path) -> None:
+    jsonl_path = run_dir / "request_profile.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as file:
+        for row in profiles:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    csv_path = run_dir / "request_profile.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=REQUEST_PROFILE_CSV_FIELDS)
+        writer.writeheader()
+        for profile in profiles:
+            row = {}
+            for field in REQUEST_PROFILE_CSV_FIELDS:
+                value = profile.get(field)
+                row[field] = (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    if isinstance(value, (dict, list)) else value
+                )
+            writer.writerow(row)
+
+
+def print_request_phase_summary(profiles: list[dict[str, Any]]) -> None:
+    print("\nRun-wide request-level server phases (initial physical attempt per logical request):")
+    initial = [row for row in profiles if not row.get("logical_retry")]
+    if not initial:
+        print("  unavailable")
+        return
+    print(
+        f"  {'phase':<24} {'n':>5} {'p50_s':>10} {'p90_s':>10} {'max_s':>10}"
+    )
+    for label, field in (
+        ("P engine queue", "prefill_engine_queue_s"),
+        ("P engine prefill elapsed", "prefill_engine_prefill_elapsed_s"),
+        ("D engine queue", "decode_engine_queue_s"),
+        ("D engine prefill elapsed", "decode_engine_prefill_elapsed_s"),
+        ("D engine decode elapsed", "decode_engine_decode_elapsed_s"),
+        ("D engine TTFT", "decode_engine_ttft_s"),
+        ("proxy->decode HTTP", "decode_http_s"),
+        ("P prefill HTTP", "prefill_http_s"),
+    ):
+        values = metric_values(initial, field)
+        if values:
+            print(
+                f"  {label:<24} {len(values):>5} {percentile(values, .5):>10.4f} "
+                f"{percentile(values, .9):>10.4f} {max(values):>10.4f}"
+            )
+        else:
+            print(f"  {label:<24} {0:>5} {'-':>10} {'-':>10} {'-':>10}")
+    uncached = metric_values(initial, "uncached_prompt_tokens_observed")
+    lost = metric_values(initial, "lost_reusable_tokens")
+    preemptions = metric_values(initial, "decode_engine_num_preemptions")
+    print(
+        "  semantics: engine prefill elapsed includes prompt compute/recompute and "
+        "stalls/preemptions from first schedule to first token. Uncached tokens "
+        "include the new append; lost reusable tokens are the cache-loss estimate."
+    )
+    if uncached:
+        print(
+            f"  observed uncached prompt tokens p50={percentile(uncached, .5):.0f} "
+            f"p90={percentile(uncached, .9):.0f} max={max(uncached):.0f}"
+        )
+    if lost:
+        print(
+            f"  lost reusable tokens p50={percentile(lost, .5):.0f} "
+            f"p90={percentile(lost, .9):.0f} max={max(lost):.0f}"
+        )
+    if preemptions:
+        print(
+            f"  per-request preemptions total={sum(preemptions):.0f} "
+            f"requests>0={sum(value > 0 for value in preemptions)}/{len(preemptions)}"
+        )
+
+
 def legacy_conversation(trace: dict[str, Any], proxy: list[dict[str, Any]]) -> str | None:
     nearest_conversations = []
     for step in trace.get("steps_detail", []):
@@ -499,7 +792,12 @@ def print_counter_deltas(metrics: list[dict[str, Any]]) -> None:
         print(f"  :{port} {text or 'counters unavailable'}")
 
 
-def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_metrics: list[dict[str, Any]]) -> None:
+def analyze_trace(
+    trace: dict[str, Any],
+    all_proxy: list[dict[str, Any]],
+    all_metrics: list[dict[str, Any]],
+    request_profiles: list[dict[str, Any]],
+) -> None:
     steps = trace.get("steps_detail", [])
     start = float(trace.get("episode_start") or (steps[0].get("step_start") if steps else 0) or 0)
     end = float(trace.get("episode_end") or start + float(trace.get("episode_duration_s") or 0))
@@ -571,6 +869,52 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         )
         previous_step = step
 
+    print("\nRequest-level server phases (one row per physical HTTP attempt):")
+    print(
+        f"  {'step':>4} {'phys':>4} {'phase':>22} {'queue':>8} {'prefill':>8} "
+        f"{'decode':>8} {'uncached':>9} {'preempt':>7} {'wait0/max':>11} "
+        f"{'kv0/max':>13} {'active_ep':>9}"
+    )
+    for step in ordered_steps:
+        for physical_index, physical in enumerate(
+            step_requests.get(step.get("step"), []), start=1
+        ):
+            candidates = [
+                row for row in request_profiles
+                if row.get("client_request_id") == physical.get("client_request_id")
+                and row.get("ts_enter") == physical.get("ts_enter")
+            ]
+            row = candidates[0] if candidates else physical
+
+            def number(field: str, digits: int = 3) -> str:
+                value = row.get(field)
+                return f"{float(value):.{digits}f}" if isinstance(value, (int, float)) else "-"
+
+            wait_enter = number("load_enter_waiting", 0)
+            wait_max = number("load_max_waiting", 0)
+            kv_enter = row.get("load_enter_kv_usage")
+            kv_max = row.get("load_max_kv_usage")
+            kv_text = (
+                f"{float(kv_enter):.0%}/{float(kv_max):.0%}"
+                if isinstance(kv_enter, (int, float)) and isinstance(kv_max, (int, float))
+                else "-/-"
+            )
+            print(
+                f"  {int(step.get('step', 0)):>4} {physical_index:>4} "
+                f"{str(row.get('request_phase') or 'default'):>22.22} "
+                f"{number('decode_engine_queue_s'):>8} "
+                f"{number('decode_engine_prefill_elapsed_s'):>8} "
+                f"{number('decode_engine_decode_elapsed_s'):>8} "
+                f"{str(row.get('uncached_prompt_tokens_observed') if row.get('uncached_prompt_tokens_observed') is not None else '-'):>9} "
+                f"{str(row.get('decode_engine_num_preemptions') if row.get('decode_engine_num_preemptions') is not None else '-'):>7} "
+                f"{wait_enter + '/' + wait_max:>11} {kv_text:>13} "
+                f"{str(row.get('same_node_other_active_episodes', '-')):>9}"
+            )
+    print(
+        "  prefill=engine elapsed from first schedule to first token (compute/recompute + stalls); "
+        "uncached=prompt_tokens-cached_tokens."
+    )
+
     dynamic_rows = [
         requests[0]
         for step in ordered_steps
@@ -585,6 +929,19 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         context_estimates = metric_values(dynamic_rows, "decision_context_tokens_est")
         actual_outputs = metric_values(dynamic_rows, "completion_tokens")
         route_counts = Counter(str(row.get("route") or "unknown") for row in dynamic_rows)
+        decision_sources = Counter(
+            str(row.get("decision_source") or "unknown") for row in dynamic_rows
+        )
+        selected_cells = Counter(
+            json.dumps(row.get("selected_calibration_cell"), sort_keys=True)
+            for row in dynamic_rows if row.get("selected_calibration_cell")
+        )
+        window_qps_5s = [
+            float(snapshot["logical_window_qps_5s"])
+            for row in dynamic_rows
+            if isinstance((snapshot := row.get("decision_rate_snapshot")), dict)
+            and isinstance(snapshot.get("logical_window_qps_5s"), (int, float))
+        ]
         feature_sources = Counter(str(row.get("feature_source") or "unknown") for row in dynamic_rows)
         feature_estimators = Counter(
             str(row.get("feature_token_estimator") or "unknown") for row in dynamic_rows
@@ -605,9 +962,18 @@ def analyze_trace(trace: dict[str, Any], all_proxy: list[dict[str, Any]], all_me
         )
         if qps_values:
             print(
-                f"  qps_est p50={statistics.median(qps_values):.3f} "
+                "  decision_qps(prior logical requests / proxy uptime, min denominator 1s) "
+                f"p50={statistics.median(qps_values):.3f} "
                 f"p90={percentile(qps_values, .9):.3f} max={max(qps_values):.3f}"
             )
+        if window_qps_5s:
+            print(
+                f"  observed logical 5s-window qps p50={statistics.median(window_qps_5s):.3f} "
+                f"p90={percentile(window_qps_5s, .9):.3f} max={max(window_qps_5s):.3f}"
+            )
+        print(f"  decision_sources={dict(decision_sources)}")
+        if selected_cells:
+            print(f"  selected_calibration_cells={dict(selected_cells)}")
         estimate_parts = []
         for label, values in (
             ("append", input_estimates), ("output_cap", output_estimates),
@@ -788,9 +1154,17 @@ def main() -> int:
         return 2
     proxy = load_jsonl(proxy_path)
     metrics = load_metrics(metrics_path)
+    request_profiles = build_request_profiles(proxy, metrics, traces)
+    if args.run_dir:
+        write_request_profiles(request_profiles, Path(args.run_dir))
+        print(
+            f"request-level artifacts: {Path(args.run_dir) / 'request_profile.jsonl'} "
+            f"and {Path(args.run_dir) / 'request_profile.csv'}"
+        )
     for trace in traces:
-        analyze_trace(trace, proxy, metrics)
+        analyze_trace(trace, proxy, metrics, request_profiles)
     print("=" * 100)
+    print_request_phase_summary(request_profiles)
     all_tool_events = [event for trace in traces for event in tool_events(trace)]
     print_tool_operation_summary(
         all_tool_events,
