@@ -62,7 +62,7 @@ kill -TERM "$METRICS_PID" 2>/dev/null || true
 wait "$METRICS_PID" 2>/dev/null || true
 printf 'end_ts=%s\nworkload_status=%s\n' "$(date +%s.%N)" "$WORKLOAD_STATUS" >> "$RUN_DIR/manifest.txt"
 
-python "$PROJECT_DIR/scripts/profile_analyze.py" --run-dir "$RUN_DIR" \
+python "$PROJECT_DIR/scripts/profile_analyze_v2.py" --run-dir "$RUN_DIR" \
     2>&1 | tee "$RUN_DIR/analysis.txt"
 ANALYZE_STATUS=${PIPESTATUS[0]}
 echo "Profiling artifacts: $RUN_DIR"
