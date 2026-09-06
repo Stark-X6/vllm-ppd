@@ -180,6 +180,17 @@ def classify_tool_operation(name: str, arguments: dict[str, Any]) -> tuple[str, 
         path = str(arguments.get("path") or "")
         return f"editor:{operation}", path[:120]
 
+    split_editor_operations = {
+        "view_file": "view",
+        "create_file": "create",
+        "replace_text": "str_replace",
+        "insert_text": "insert",
+        "undo_edit": "undo_edit",
+    }
+    if name in split_editor_operations:
+        path = str(arguments.get("path") or "")
+        return f"editor:{split_editor_operations[name]}", path[:120]
+
     return name or "unknown", ""
 
 
