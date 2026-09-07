@@ -1,4 +1,13 @@
-from scripts.profile_analyze_v2 import build_request_profiles
+from scripts.profile_analyze_v2 import build_request_profiles, percentile
+
+
+def test_percentile_interpolates_small_samples():
+    assert percentile([], 0.9) is None
+    assert percentile([3.0], 0.9) == 3.0
+    assert abs(percentile([3.0, 69.0], 0.9) - 62.4) < 1e-9
+    assert percentile([3.0, 69.0], -1.0) == 3.0
+    assert percentile([3.0, 69.0], 2.0) == 69.0
+
 
 
 def test_request_profile_joins_both_nodes_and_live_episodes():

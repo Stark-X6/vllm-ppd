@@ -70,8 +70,13 @@ def percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
-    index = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * fraction)))
-    return ordered[index]
+    # Linear interpolation avoids the surprising nearest-rank behaviour where,
+    # for example, p90([3, 69]) was reported as the minimum value.
+    position = (len(ordered) - 1) * max(0.0, min(1.0, fraction))
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
 
 
 def metric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -823,8 +828,11 @@ def analyze_trace(
         warnings.append("no proxy records joined")
     if not healthy_metrics:
         warnings.append("no metrics in episode window: load and eviction are UNKNOWN")
-    if proxy and not any(row.get("ttft_s") is not None for row in proxy):
-        warnings.append("TTFT unavailable (non-streaming requests)")
+    if proxy and not any(
+        row.get("decode_engine_ttft_s") is not None or row.get("ttft_s") is not None
+        for row in proxy
+    ):
+        warnings.append("request-level TTFT unavailable")
     if not any(
         step.get("cached_tokens") is not None for step in steps
     ) and not any(row.get("cached_tokens") is not None for row in proxy):
