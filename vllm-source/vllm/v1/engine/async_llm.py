@@ -34,7 +34,7 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.utils.math_utils import cdiv
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.v1.engine.core_client import AsyncMPClient, DPAsyncMPClient, EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
@@ -789,6 +789,19 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
+
+    async def observe_ppd_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Owner-thread observation, never a GPU-worker collective RPC."""
+        if os.environ.get("VLLM_PPD_OBSERVER_ENABLED") != "1":
+            raise NotImplementedError("PPD observer is disabled")
+        if (
+            self.vllm_config.parallel_config.data_parallel_size != 1
+            or not isinstance(self.engine_core, AsyncMPClient)
+            or isinstance(self.engine_core, DPAsyncMPClient)
+        ):
+            # DP utility dispatch can fan out and silently return just one core.
+            raise NotImplementedError("PPD observer requires one async engine core")
+        return await self.engine_core.call_utility_async("observe_ppd_state", payload)
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""

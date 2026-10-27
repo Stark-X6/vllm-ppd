@@ -185,6 +185,10 @@ class EngineClient(ABC):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
 
+    async def observe_ppd_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Read one EngineCore-owned snapshot without submitting generation."""
+        raise NotImplementedError
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError

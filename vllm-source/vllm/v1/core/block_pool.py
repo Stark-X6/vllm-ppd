@@ -178,6 +178,8 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        # Optional observer-owned metadata only; never pins or touches blocks.
+        self.ppd_observer = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -263,6 +265,11 @@ class BlockPool:
             )
             blk.block_hash = block_hash_with_group_id
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
+            if self.ppd_observer is not None:
+                self.ppd_observer.event(
+                    "cache_insert", request, blk,
+                    (num_cached_blocks + i + 1) * block_size,
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -334,6 +341,8 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("cache_evict", block)
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -445,6 +454,9 @@ class BlockPool:
             self.metrics_collector.reset()
 
         logger.info("Successfully reset prefix cache")
+
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("cache_reset")
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())

@@ -1,0 +1,423 @@
+{
+  "benchmark": "ppd_observer_fake_cpu_v1",
+  "block_size": 16,
+  "cases": [
+    {
+      "bookkeeping": [
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 2.5290500000000002,
+            "median_us": 2.47885,
+            "min_us": 2.2779499999999997,
+            "p95_us": 2.52825,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 11,
+          "inner_iterations": 20,
+          "insert_tokens": 64,
+          "inserted_then_evicted_blocks": 4,
+          "observer": {
+            "max_us": 52.1292,
+            "median_us": 33.6496,
+            "min_us": 33.1594,
+            "p95_us": 34.85285,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 49.8212,
+            "median_us": 31.146349999999998,
+            "min_us": 30.63315,
+            "p95_us": 32.5749,
+            "samples": 21
+          },
+          "requests": 16,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        },
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 3.3851,
+            "median_us": 2.9802,
+            "min_us": 2.8072,
+            "p95_us": 3.172,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 1027,
+          "inner_iterations": 10,
+          "insert_tokens": 8192,
+          "inserted_then_evicted_blocks": 512,
+          "observer": {
+            "max_us": 8850.5671,
+            "median_us": 1340.1499,
+            "min_us": 1323.0049,
+            "p95_us": 8849.8844,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 8847.754799999999,
+            "median_us": 1337.1307,
+            "min_us": 1319.8875999999998,
+            "p95_us": 8846.813300000002,
+            "samples": 21
+          },
+          "requests": 16,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        }
+      ],
+      "probe_tokens": 4097,
+      "ready_cached_tokens": 4096,
+      "requests": 16,
+      "state_only": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 0.724,
+          "median_us": 0.45,
+          "min_us": 0.332,
+          "p95_us": 0.635,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 61.245,
+          "median_us": 59.71,
+          "min_us": 58.424,
+          "p95_us": 60.97,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 60.573,
+          "median_us": 59.075,
+          "min_us": 57.995,
+          "p95_us": 60.521,
+          "samples": 21
+        }
+      },
+      "state_plus_probe": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 1.541,
+          "median_us": 0.751,
+          "min_us": 0.361,
+          "p95_us": 1.144,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 56991.152,
+          "median_us": 1715.805,
+          "min_us": 1702.234,
+          "p95_us": 1745.16,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 56989.611,
+          "median_us": 1714.949,
+          "min_us": 1701.789,
+          "p95_us": 1744.162,
+          "samples": 21
+        }
+      }
+    },
+    {
+      "bookkeeping": [
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 20.589650000000002,
+            "median_us": 9.2119,
+            "min_us": 7.86305,
+            "p95_us": 11.7466,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 11,
+          "inner_iterations": 20,
+          "insert_tokens": 64,
+          "inserted_then_evicted_blocks": 4,
+          "observer": {
+            "max_us": 2850.27535,
+            "median_us": 86.10045,
+            "min_us": 80.77560000000001,
+            "p95_us": 88.51689999999999,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 2841.06345,
+            "median_us": 78.20165,
+            "min_us": 67.59395,
+            "p95_us": 79.39779999999999,
+            "samples": 21
+          },
+          "requests": 64,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        },
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 12.2667,
+            "median_us": 11.1631,
+            "min_us": 10.6829,
+            "p95_us": 12.1422,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 1027,
+          "inner_iterations": 10,
+          "insert_tokens": 8192,
+          "inserted_then_evicted_blocks": 512,
+          "observer": {
+            "max_us": 7688.9836,
+            "median_us": 1376.2527,
+            "min_us": 1355.9115,
+            "p95_us": 7303.1227,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 7677.0452,
+            "median_us": 1365.0895999999998,
+            "min_us": 1343.8571000000002,
+            "p95_us": 7291.0318,
+            "samples": 21
+          },
+          "requests": 64,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        }
+      ],
+      "probe_tokens": 32769,
+      "ready_cached_tokens": 32768,
+      "requests": 64,
+      "state_only": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 0.809,
+          "median_us": 0.509,
+          "min_us": 0.325,
+          "p95_us": 0.623,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 191.816,
+          "median_us": 184.524,
+          "min_us": 183.081,
+          "p95_us": 189.661,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 191.231,
+          "median_us": 184,
+          "min_us": 182.548,
+          "p95_us": 189.055,
+          "samples": 21
+        }
+      },
+      "state_plus_probe": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 1.35,
+          "median_us": 0.966,
+          "min_us": 0.422,
+          "p95_us": 1.34,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 72967.84,
+          "median_us": 13743.995,
+          "min_us": 13629.009,
+          "p95_us": 68878.028,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 72967.418,
+          "median_us": 13743.554,
+          "min_us": 13627.755,
+          "p95_us": 68876.701,
+          "samples": 21
+        }
+      }
+    },
+    {
+      "bookkeeping": [
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 39.4801,
+            "median_us": 36.57415,
+            "min_us": 32.42895,
+            "p95_us": 39.45645,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 11,
+          "inner_iterations": 20,
+          "insert_tokens": 64,
+          "inserted_then_evicted_blocks": 4,
+          "observer": {
+            "max_us": 2837.13575,
+            "median_us": 275.13625,
+            "min_us": 264.88045,
+            "p95_us": 2833.6856000000002,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 2804.5765499999998,
+            "median_us": 236.53934999999998,
+            "min_us": 231.518,
+            "p95_us": 2798.5974000000006,
+            "samples": 21
+          },
+          "requests": 256,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        },
+        {
+          "alternating_order": true,
+          "baseline": {
+            "max_us": 57.660199999999996,
+            "median_us": 49.2157,
+            "min_us": 44.284,
+            "p95_us": 55.9959,
+            "samples": 21
+          },
+          "callbacks": [
+            "begin_execution",
+            "cache_insert",
+            "finish_execution",
+            "after_update",
+            "cache_evict"
+          ],
+          "callbacks_per_batch": 1027,
+          "inner_iterations": 10,
+          "insert_tokens": 8192,
+          "inserted_then_evicted_blocks": 512,
+          "observer": {
+            "max_us": 7201.8506,
+            "median_us": 1686.9776000000002,
+            "min_us": 1650.7457,
+            "p95_us": 6987.8617,
+            "samples": 21
+          },
+          "observer_error": null,
+          "paired_added": {
+            "max_us": 7152.634899999999,
+            "median_us": 1640.1494,
+            "min_us": 1605.9206000000001,
+            "p95_us": 6941.6167000000005,
+            "samples": 21
+          },
+          "requests": 256,
+          "scope": "bookkeeping for one synthetic chunk plus batch lifecycle; no model execution"
+        }
+      ],
+      "probe_tokens": 131073,
+      "ready_cached_tokens": 131072,
+      "requests": 256,
+      "state_only": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 0.888,
+          "median_us": 0.55,
+          "min_us": 0.328,
+          "p95_us": 0.805,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 744.567,
+          "median_us": 735.813,
+          "min_us": 714.599,
+          "p95_us": 741.759,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 744.142,
+          "median_us": 735.463,
+          "min_us": 713.794,
+          "p95_us": 741.2,
+          "samples": 21
+        }
+      },
+      "state_plus_probe": {
+        "alternating_order": true,
+        "baseline": {
+          "max_us": 2.73,
+          "median_us": 1.333,
+          "min_us": 0.527,
+          "p95_us": 2.614,
+          "samples": 21
+        },
+        "inner_iterations": 1,
+        "observer": {
+          "max_us": 162536.112,
+          "median_us": 106782.83,
+          "min_us": 103085.066,
+          "p95_us": 161351.067,
+          "samples": 21
+        },
+        "paired_added": {
+          "max_us": 162535.484,
+          "median_us": 106780.666,
+          "min_us": 103082.751,
+          "p95_us": 161350.439,
+          "samples": 21
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "fake supported engine objects; not native vLLM integration",
+    "SHA256 substitute, not native block hasher; native hash cost is unmeasured",
+    "no GPU work, HTTP, IPC, tokenizer, process contention or serving slowdown measured",
+    "10 Hz production throttle bypassed solely for per-query microtiming",
+    "query baseline is a minimal dispatcher stub, not real serving",
+    "hook comparison measures 64-token/8192-token synthetic chunks and batch lifecycle"
+  ],
+  "platform": "Linux-5.15.0-78-generic-x86_64-with-glibc2.35",
+  "python": "3.10.14",
+  "recorded_date": "2026-10-23",
+  "command": "PYTHONDONTWRITEBYTECODE=1 python3 scripts/benchmark/benchmark_ppd_observer_cpu.py --rounds 21 --requests 16 64 256 --probe-tokens 4097 32769 131073 --hook-inner 20",
+  "measurement_note": "Recorded after final CPU tests completed; single-host repeated microtimings, not independent serving runs.",
+  "source_sha256": {
+    "vllm-source/vllm/v1/core/ppd_observer.py": "e21a9d558123222b134d238dbac3de312ffc3e9e5601a6af81eaed9141e67a2e",
+    "scripts/benchmark/benchmark_ppd_observer_cpu.py": "2e26e7b0a9797c62fe455d3ef18e1be70128bb5d40b36c75fee88d30e31fb5ac",
+    "tests/test_ppd_state_observer.py": "12207810e042cee471c10d3e2a37e2493efe914b446375a03644ca213a7e7027"
+  }
+}

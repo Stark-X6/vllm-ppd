@@ -122,6 +122,12 @@ For a non-streaming response, proxy `http_first_byte_s` is approximately the
 completed-response time, not model TTFT. Use `*_engine_ttft_s` for TTFT and
 `*_http_s` for the full proxy-to-server request.
 
+Here engine TTFT is **node-local**, observed at frontend output handling. In
+the Remote path, D engine TTFT excludes the preceding P request; it must not
+be treated as route-wide TTFT. The legacy benchmark's client-stream TTFT and
+TPOT use different observation boundaries. Their frozen distinction is in
+[stage-5 state semantics](./stage5_state_semantics_contract.md).
+
 ## 6. Server-load semantics
 
 Each request profile records P and generation-node (D/pD) data independently:
@@ -146,6 +152,12 @@ The two concurrency measures are different by design:
 Node metrics are sampled, normally every 0.5 seconds. Entry/exit join deltas
 are stored so a missing or distant sample is visible rather than silently
 treated as exact.
+
+The poller's historical `tpot_sum/count` alias reads
+`vllm:time_per_output_token_seconds`. In this vendored version that hidden
+histogram observes ITL output-event intervals, not per-request mean TPOT.
+Keep existing artifacts unchanged, but do not pool this alias with request
+TPOT or use it as a calibrated request-level score label.
 
 ## 7. Dynamic decision metadata and QPS
 
@@ -185,3 +197,17 @@ strict mode before a matched run is accepted.
 No result should be compared across configs unless the sample order, routing
 key set, map fingerprint, model/Agent commits, model parameters, concurrency
 and episode count all match.
+
+## 9. Stage-5 semantic freeze, not runtime integration
+
+The independent `ppd-state-semantics-v1` contract defines canonical N/H/A,
+effective ready C/U, decode B/K, prefill ready/scheduled/target frontiers,
+physical pending deduplication, and timing populations. See
+[the contract](./stage5_state_semantics_contract.md) and its CPU-only reference
+arithmetic in `ppd/optimizer/state_semantics.py`.
+
+These definitions do not add fields to the running schema versions above.
+No new routing policy, AMPD gate or TTL is enabled. The optional, default-off
+[read-only observer](./stage5_readonly_observer.md) now has CPU-tested engine/API
+plumbing. Native GPU/IPC validation and proxy pending identity integration remain
+pending; unavailable state must still not be interpreted as zero.

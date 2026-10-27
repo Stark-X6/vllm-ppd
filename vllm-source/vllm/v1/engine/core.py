@@ -204,6 +204,16 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        self.ppd_observer = None
+        if os.environ.get("VLLM_PPD_OBSERVER_ENABLED") == "1":
+            from vllm.v1.core.ppd_observer import PpdStateObserver
+
+            self.ppd_observer = PpdStateObserver(self)
+            if self.ppd_observer.unsupported is None:
+                self.scheduler.kv_cache_manager.block_pool.ppd_observer = (
+                    self.ppd_observer
+                )
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -298,6 +308,8 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("request_added", request)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -306,6 +318,8 @@ class EngineCore:
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("after_update")
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -345,6 +359,8 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("begin_execution", scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -352,12 +368,17 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("finish_execution", model_output)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.ppd_observer is not None:
+            self.ppd_observer.event("after_update")
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -487,6 +508,12 @@ class EngineCore:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
+
+    def observe_ppd_state(self, payload: dict) -> dict:
+        """Owner-thread utility only; never calls the GPU worker collective."""
+        if self.ppd_observer is None:
+            return {"available": False, "reason": "observer_disabled"}
+        return self.ppd_observer.observe(payload)
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)
